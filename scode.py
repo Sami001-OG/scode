@@ -542,6 +542,231 @@ def log_history(session_id: str, role: str, content: str, tool_calls: list = Non
             (time.time(), session_id, role, content, json.dumps(tool_calls) if tool_calls else None))
 
 # --- main agent loop ---
+
+# --- image input tools (Codex-like) ---
+@tool("vision_analyze", "Analyze an image with vision model. image_path=path, question=string.", {
+    "type":"object","properties":{"image_path":{"type":"string"},"question":{"type":"string"}},"required":["image_path","question"]
+})
+def t_vision_analyze(image_path: str, question: str) -> str:
+    """Analyze an image using vision capabilities."""
+    try:
+        from hermes_tools import vision_analyze
+        result = vision_analyze(image_url=safe_path(image_path), question=question)
+        return result.get("text", str(result))
+    except Exception as e:
+        return f"ERROR: {e}"
+
+@tool("image_describe", "Describe an image in detail. image_path=path.", {
+    "type":"object","properties":{"image_path":{"type":"string"}},"required":["image_path"]
+})
+def t_image_describe(image_path: str) -> str:
+    """Get a detailed description of an image."""
+    try:
+        from hermes_tools import vision_analyze
+        result = vision_analyze(image_url=safe_path(image_path), question="Describe this image in detail, including any text, code, UI elements, or diagrams visible.")
+        return result.get("text", str(result))
+    except Exception as e:
+        return f"ERROR: {e}"
+
+# --- worktree tools (Codex-like) ---
+@tool("git_worktree_add", "Add a git worktree. path=path, branch=branch (optional).", {
+    "type":"object","properties":{"path":{"type":"string"},"branch":{"type":"string"}},"required":["path"]
+})
+def t_git_worktree_add(path: str, branch: str = "") -> str:
+    """Add a git worktree for isolated development."""
+    p = safe_path(path)
+    cmd = f"git worktree add {p}"
+    if branch:
+        cmd += f" {branch}"
+    return run_cmd(cmd)
+
+@tool("git_worktree_list", "List git worktrees.", {
+    "type":"object","properties":{}
+})
+def t_git_worktree_list() -> str:
+    """List all git worktrees."""
+    return run_cmd("git worktree list")
+
+@tool("git_worktree_remove", "Remove a git worktree. path=path.", {
+    "type":"object","properties":{"path":{"type":"string"}},"required":["path"]
+})
+def t_git_worktree_remove(path: str) -> str:
+    """Remove a git worktree."""
+    p = safe_path(path)
+    return run_cmd(f"git worktree remove {p}")
+
+# --- test execution tools (Codex-like) ---
+@tool("test_run", "Run tests. command=string (e.g., 'pytest', 'npm test', 'go test').", {
+    "type":"object","properties":{"command":{"type":"string","default":"pytest"}},"required":[]
+})
+def t_test_run(command: str = "pytest") -> str:
+    """Run test suite."""
+    return run_cmd(command)
+
+@tool("test_watch", "Run tests in watch mode. command=string (e.g., 'pytest --watch').", {
+    "type":"object","properties":{"command":{"type":"string","default":"pytest --watch"}},"required":[]
+})
+def t_test_watch(command: str = "pytest --watch") -> str:
+    """Run tests in watch mode."""
+    return run_cmd(command)
+
+@tool("test_coverage", "Run tests with coverage. command=string.", {
+    "type":"object","properties":{"command":{"type":"string"}},"required":["command"]
+})
+def t_test_coverage(command: str) -> str:
+    """Run tests with coverage reporting."""
+    return run_cmd(command)
+
+# --- repository understanding (Codex-like) ---
+@tool("repo_structure", "Show repository structure. depth=integer (default 2).", {
+    "type":"object","properties":{"depth":{"type":"integer","default":2}},"required":[]
+})
+def t_repo_structure(depth: int = 2) -> str:
+    """Show repository structure as a tree."""
+    try:
+        import subprocess
+        result = subprocess.run(["find", ".", "-type", "f", "-not", "-path", "*/.*/*"], 
+                              capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            files = result.stdout.strip().split('\n')
+            # Simple tree view
+            tree_lines = []
+            for f in sorted(files):
+                if f:  # Skip empty lines
+                    depth = f.count('/')
+                    indent = "  " * depth
+                    name = f.split('/')[-1] if '/' in f else f
+                    tree_lines.append(f"{indent}{name}")
+            return '\n'.join(tree_lines[:100]) or "(no files)"
+        else:
+            return f"ERROR: {result.stderr}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+@tool("repo_dependencies", "Show project dependencies (package.json, requirements.txt, etc.).", {
+    "type":"object","properties":{}
+})
+def t_repo_dependencies() -> str:
+    """Show project dependencies from various package managers."""
+    deps = []
+    # Check common dependency files
+    dep_files = [
+        ("package.json", "npm/yarn"),
+        ("requirements.txt", "pip"),
+        ("Pipfile", "pipenv"),
+        ("pyproject.toml", "poetry/PEP 517"),
+        ("Cargo.toml", "rust"),
+        ("go.mod", "go"),
+        ("pom.xml", "maven"),
+        ("build.gradle", "gradle"),
+        ("composer.json", "php")
+    ]
+    
+    for file_desc, manager in dep_files:
+        p = safe_path(file_desc)
+        if p.exists():
+            try:
+                content = p.read_text()[:500]
+                deps.append(f"=== {file_desc} ({manager}) ===\n{content}")
+            except:
+                deps.append(f"=== {file_desc} ({manager}) ===\n[could not read]")
+    
+    return '\n\n'.join(deps) if deps else "(no dependency files found)"
+
+@tool("repo_language_stats", "Show language statistics via github-linguist or cloc fallback.", {
+    "type":"object","properties":{}
+})
+def t_repo_language_stats() -> str:
+    """Show programming language usage."""
+    # Try to use cloc if available
+    if shutil.which("cloc"):
+        return run_cmd("cloc . --by-file --json")
+    else:
+        # Fallback to simple extension counting
+        try:
+            from collections import Counter
+            import os
+            ext_counter = Counter()
+            total_files = 0
+            
+            for root, dirs, files in os.walk("."):
+                # Skip hidden dirs and common build dirs
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'node_modules', '__pycache__', 'dist', 'build', '.git'}]
+                for f in files:
+                    if not f.startswith('.'):
+                        total_files += 1
+                        ext = os.path.splitext(f)[1]
+                        if ext:
+                            ext_counter[ext] += 1
+            
+            if total_files == 0:
+                return "(no files found)"
+            
+            result = [f"Total files: {total_files}"]
+            for ext, count in ext_counter.most_common(10):
+                pct = (count / total_files) * 100
+                result.append(f"{ext or '(no extension)'}: {count} files ({pct:.1f}%)")
+            return "\n".join(result)
+        except Exception as e:
+            return f"ERROR: {e}"
+
+# --- AGENTS.md support (Codex-like) ---
+@tool("agents_read", "Read AGENTS.md file for project-specific instructions.", {
+    "type":"object","properties":{}
+})
+def t_agents_read() -> str:
+    """Read AGENTS.md if it exists."""
+    p = safe_path("AGENTS.md")
+    if p.exists():
+        return p.read_text()
+    else:
+        return "(AGENTS.md not found)"
+
+@tool("agents_write", "Write or update AGENTS.md file. content=string.", {
+    "type":"object","properties":{"content":{"type":"string"}},"required":["content"]
+})
+def t_agents_write(content: str) -> str:
+    """Write AGENTS.md file."""
+    p = safe_path("AGENTS.md")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return f"wrote AGENTS.md ({len(content)} bytes)"
+
+# --- context compaction (Codex-like) ---
+@tool("context_compact", "Compact conversation history to save tokens. keep_last=integer (default 5).", {
+    "type":"object","properties":{"keep_last":{"type":"integer","default":5}},"required":[]
+})
+def t_context_compact(keep_last: int = 5) -> str:
+    """Compact the conversation history to reduce token usage."""
+    global messages
+    if len(messages) <= keep_last + 2:  # +2 for system and maybe one other
+        return f"(history only {len(messages)} messages, no compaction needed)"
+    
+    # Keep system message and last N messages
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    recent_msgs = messages[-(keep_last):] if len(messages) > keep_last else []
+    
+    # What we're removing
+    removed_count = len(messages) - len(system_msgs) - len(recent_msgs)
+    
+    # Rebuild messages
+    messages.clear()
+    messages.extend(system_msgs)
+    messages.extend(recent_msgs)
+    
+    return f"compacted context: removed {removed_count} messages, kept {len(messages)}"
+
+# --- long running task helpers (Codex-like) ---
+@tool("task_breakdown", "Break down a complex task into steps. goal=string.", {
+    "type":"object","properties":{"goal":{"type":"string"}},"required":["goal"]
+})
+def t_task_breakdown(goal: str) -> str:
+    """Ask the AI to break down a goal into steps."""
+    # This would typically involve an LLM call, but we'll return a placeholder
+    # In practice, this could be implemented as a subagent call or special prompt
+    return f"To break down '{goal}':\\n1. Understand the requirements\\n2. Research existing solutions\\n3. Implement core functionality\\n4. Test and iterate\\n5. Document and clean up"
+
+# --- main agent loop ---
 SYSTEM_PROMPT = """You are Scout v2, a comprehensive CLI coding agent.
 Capabilities: file ops, bash, grep, git, web, subagents, MCP, skills, ACP, harness switching, plan mode, steering.
 - Be concise. Use tools, not narration.
