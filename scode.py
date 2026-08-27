@@ -233,6 +233,38 @@ def t_todo(items: list) -> str:
     AGENT_STATE["todos"] = items
     return "ok"
 
+@tool("notebook_edit", "Edit a Jupyter notebook (.ipynb) by modifying a cell at a given index. Provide the notebook path, cell index, and new cell content (string or list of strings).", {
+    "type":"object","properties":{"path":{"type":"string"},"cell_index":{"type":"integer"},"content":{"type":"string"},"cell_type":{"type":"string","enum":["code","markdown"],"default":"code"}},
+    "required":["path","cell_index","content"]
+})
+def t_notebook_edit(path: str, cell_index: int, content: str, cell_type: str = "code") -> str:
+    p = safe_path(path)
+    if not p.exists():
+        return f"ERROR: {path} not found"
+    try:
+        nb = json.loads(p.read_text())
+    except Exception as e:
+        return f"ERROR: failed to parse notebook: {e}"
+    if 'cells' not in nb or not isinstance(nb['cells'], list):
+        return "ERROR: not a valid notebook (no cells list)"
+    if cell_index < 0 or cell_index >= len(nb['cells']):
+        return f"ERROR: cell index {cell_index} out of range (0-{len(nb['cells'])-1})"
+    # Normalize content to a list of strings (each string is a line)
+    if isinstance(content, str):
+        lines = content.splitlines()
+    else:
+        lines = list(content)
+    # Update the cell
+    cell = nb['cells'][cell_index]
+    cell['cell_type'] = cell_type
+    cell['source'] = lines
+    try:
+        p.write_text(json.dumps(nb, indent=1))
+    except Exception as e:
+        return f"ERROR: failed to write notebook: {e}"
+    return f"updated cell {cell_index} in {path}"
+
+
 @tool("web_search", "Search the web via DuckDuckGo HTML. query=string. limit=N (default 5).", {
     "type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","default":5}},"required":["query"]
 })
@@ -481,7 +513,7 @@ def confirm_tool(name: str, args: dict) -> bool:
     cfg = load_cfg()
     if name == "bash":
         if cfg.get("auto_approve_shell"): return True
-    elif name in ("write_file","edit_file"):
+    elif name in ("write_file","edit_file","notebook_edit"):
         if cfg.get("auto_approve_write"): return True
     elif name in ("subagent", "mcp_call", "acp_request"):
         return True
@@ -613,6 +645,14 @@ def repl():
     cfg = ensure_cfg()
     AGENT_STATE["current_harness"] = cfg.get("harness", "native")
     
+    def get_status_bar():
+        provider = cfg.get('provider', '?')
+        model = cfg.get('model', '?')
+        harness = AGENT_STATE.get('current_harness', cfg.get('harness', 'native'))
+        shell_auto = cfg.get('auto_approve_shell', False)
+        write_auto = cfg.get('auto_approve_write', True)
+        return f"[dim]Provider: {provider} | Model: {model} | Harness: {harness} | Shell auto: {'on' if shell_auto else 'off'} | Write auto: {'on' if write_auto else 'off'}[/dim]"
+
     # session management
     CURRENT_SESSION_ID = str(uuid.uuid4())
     messages = [{"role":"system","content":SYSTEM_PROMPT.format(cwd=CWD, harness=cfg.get("harness","native"))}]
@@ -629,6 +669,7 @@ def repl():
         return
 
     while True:
+        console.print(get_status_bar())
         try:
             console.print()
             user_input = Prompt.ask("[bold green]›[/bold green]").strip()
