@@ -513,7 +513,7 @@ def confirm_tool(name: str, args: dict) -> bool:
     cfg = load_cfg()
     if name == "bash":
         if cfg.get("auto_approve_shell"): return True
-    elif name in ("write_file","edit_file","notebook_edit"):
+    elif name in ("write_file","edit_file","notebook_edit","read_file"):
         if cfg.get("auto_approve_write"): return True
     elif name in ("subagent", "mcp_call", "acp_request"):
         return True
