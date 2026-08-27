@@ -52,7 +52,7 @@ CURRENT_SESSION_ID = None
 PROVIDERS = {
     "openai":    {"base": "https://api.openai.com/v1",             "models": ["gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"]},
     "anthropic": {"base": "https://api.anthropic.com/v1",          "models": ["claude-sonnet-4-5", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"]},
-    "nvidia":    {"base": "https://integrate.api.nvidia.com/v1",   "models": ["minimaxai/minimax-m3", "meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct"]},
+    "nvidia":    {"base": "https://integrate.api.nvidia.com/v1",   "models": ["minimaxai/minimax-m3", "meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/nemotron-3-nano-30b-a3b"]},
     "groq":      {"base": "https://api.groq.com/openai/v1",        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]},
     "openrouter":{"base": "https://openrouter.ai/api/v1",          "models": ["anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-2.0-flash"]},
     "ollama":    {"base": "http://localhost:11434/v1",             "models": ["qwen2.5-coder:7b", "llama3.2", "deepseek-coder-v2", "mistral-nemo"]},
