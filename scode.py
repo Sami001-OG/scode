@@ -128,7 +128,7 @@ def ensure_cfg() -> dict:
         choice = Prompt.ask("provider", choices=[str(i) for i in range(1, len(names)+1)], default="1")
         cfg["provider"] = names[int(choice)-1]
     if "api_key" not in cfg:
-        cfg["api_key"] = Prompt.ask(f"api key for [cyan]{cfg['provider']}[/cyan] (blank to skip)", default="", password=True)
+        cfg["api_key"] = Prompt.ask(f"api key for [cyan]{cfg['provider']}[/cyan] (blank to skip)", default="")
     if "model" not in cfg:
         models = PROVIDERS[cfg["provider"]]["models"]
         for i, m in enumerate(models, 1):
@@ -668,7 +668,7 @@ def repl():
                     console.print(f"  [cyan]{i}[/cyan] {n}")
                 choice = Prompt.ask("provider", choices=[str(i) for i in range(1, len(names)+1)], default="1")
                 cfg["provider"] = names[int(choice)-1]
-                cfg["api_key"] = Prompt.ask("api key", default=cfg.get("api_key",""), password=True)
+                cfg["api_key"] = Prompt.ask("api key", default=cfg.get("api_key",""), )
                 save_cfg(cfg)
                 console.print(f"[dim]→ {cfg['provider']}[/dim]")
             elif cmd == "/harness":
