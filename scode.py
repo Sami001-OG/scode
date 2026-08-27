@@ -861,8 +861,13 @@ def show_help():
 [cyan]Alt+Enter[/cyan]      queue follow-up""", title="[bold]Scout Commands[/bold]", border_style="cyan"))
 
 # --- REPL ---
-BANNER = """[bold cyan]Scout v2[/bold cyan] [dim]· comprehensive AI coding harness[/dim]
-[dim]cwd: {cwd}[/dim]  [dim]harness: {harness}[/dim]
+BANNER = """[bold cyan]  ____  _           _     _____      _   
+[bold cyan] |  _ \|| |__   __ _| |__ | ____|_  _| |_ 
+[bold cyan] | |_) || '_ \ / _` | '_ \|  _| \ \/ / __|
+[bold cyan] |  _ <|| | | | (_| | | | | |___ >  <| |_ 
+[bold cyan] |_| \_\_|| |_|\__,_|_| |_|_____/_/\_\\__|
+[bold cyan]                                        
+[dim]Scout v2 · {cwd} | {harness}[/dim]
 [dim]type /help for commands, /quit to exit[/dim]"""
 
 def repl():
@@ -876,7 +881,9 @@ def repl():
         harness = AGENT_STATE.get('current_harness', cfg.get('harness', 'native'))
         shell_auto = cfg.get('auto_approve_shell', False)
         write_auto = cfg.get('auto_approve_write', True)
-        return f"[dim]Provider: {provider} | Model: {model} | Harness: {harness} | Shell auto: {'on' if shell_auto else 'off'} | Write auto: {'on' if write_auto else 'off'}[/dim]"
+        now = time.strftime('%H:%M:%S')
+        msg_count = len(messages)
+        return f"[dim]Provider: {provider} | Model: {model} | Harness: {harness} | Shell auto: {'on' if shell_auto else 'off'} | Write auto: {'on' if write_auto else 'off'} | {msg_count} msgs | {now}[/dim]"
 
     # session management
     CURRENT_SESSION_ID = str(uuid.uuid4())
@@ -897,7 +904,7 @@ def repl():
         console.print(get_status_bar())
         try:
             console.print()
-            user_input = Prompt.ask("[bold green]›[/bold green]").strip()
+            user_input = Prompt.ask("[bold green]🚀[/bold green] ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]bye[/dim]")
             save_session(CURRENT_SESSION_ID, messages)
