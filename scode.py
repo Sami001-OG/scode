@@ -861,18 +861,13 @@ def show_help():
 [cyan]Alt+Enter[/cyan]      queue follow-up""", title="[bold]Scout Commands[/bold]", border_style="cyan"))
 
 # --- REPL ---
-BANNER = """[bold cyan]  ███████  ██████  ██████   ██████  ██████  
-[bold cyan]  ██      ██    ██ ██   ██ ██    ██ ██   ██ 
-[bold cyan]  █████   ██    ██ ██████  ██    ██ ██████  
-[bold cyan]  ██      ██    ██ ██   ██ ██    ██ ██   ██ 
-[bold cyan]  ███████  ██████  ██   ██  ██████  ██   ██ 
+BANNER = """[bold cyan]  ██████  ██       █████  ██    ██  ██████  
+[bold cyan]  ██   ██ ██      ██   ██ ██    ██ ██    ██ 
+[bold cyan]  ██████  ██      ███████ ██    ██ ██    ██ 
+[bold cyan]  ██   ██ ██      ██   ██ ██    ██ ██    ██ 
+[bold cyan]  ██   ██ ███████ ██   ██  ██████   ██████  
 [bold cyan]                                        
-[bold magenta]  ███████  ██████  ██       █████  ██████  
-[bold magenta]  ██      ██    ██ ██      ██   ██ ██   ██ 
-[bold magenta]  ███████ ██    ██ ██      ███████ ██████  
-[bold magenta]       ██ ██    ██ ██      ██   ██ ██   ██ 
-[bold magenta]  ███████  ██████  ███████ ██   ██ ██   ██ 
-[dim]                                     SCODE | {cwd} | {harness}
+[bold magenta]        SCODE | {cwd} | {harness}
 [dim]type /help for commands, /quit to exit[/dim]"""
 
 def repl():
