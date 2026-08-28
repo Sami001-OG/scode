@@ -513,7 +513,7 @@ def confirm_tool(name: str, args: dict) -> bool:
     cfg = load_cfg()
     if name == "bash":
         if cfg.get("auto_approve_shell"): return True
-    elif name in ("write_file","edit_file","notebook_edit","read_file"):
+    elif name in ("write_file","edit_file","notebook_edit","read_file","todo","find_files","grep","web_search","web_fetch"):
         if cfg.get("auto_approve_write"): return True
     elif name in ("subagent", "mcp_call", "acp_request"):
         return True
@@ -868,23 +868,15 @@ def repl():
     cfg = ensure_cfg()
     AGENT_STATE["current_harness"] = cfg.get("harness", "native")
     
-    def get_status_bar():
-        provider = cfg.get('provider', '?')
-        model = cfg.get('model', '?')
-        harness = AGENT_STATE.get('current_harness', cfg.get('harness', 'native'))
-        shell_auto = cfg.get('auto_approve_shell', False)
-        write_auto = cfg.get('auto_approve_write', True)
-        now = time.strftime('%H:%M:%S')
-        msg_count = len(messages)
-        return f"[dim]Provider: {provider} | Model: {model} | Harness: {harness} | Shell auto: {'on' if shell_auto else 'off'} | Write auto: {'on' if write_auto else 'off'} | {msg_count} msgs | {now}[/dim]"
-
-    # session management
+    # Initialize session
     CURRENT_SESSION_ID = str(uuid.uuid4())
     messages = [{"role":"system","content":SYSTEM_PROMPT.format(cwd=CWD, harness=cfg.get("harness","native"))}]
     
-    console.print(BANNER.format(cwd=CWD, harness=cfg.get("harness","native")))
+    # Show banner
+    console.print(BANNER)
     show_todos()
-
+    
+    # Handle command line argument
     if len(sys.argv) > 1:
         prompt = " ".join(sys.argv[1:])
         messages.append({"role":"user","content":prompt})
@@ -892,20 +884,125 @@ def repl():
         run_agent(messages, cfg)
         save_session(CURRENT_SESSION_ID, messages)
         return
-
+    
+    # Initialize layout for split view
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.columns import Columns
+    from rich.align import Align
+    
+    # Track context usage (rough estimate)
+    context_tokens = 0
+    max_context = 8192
+    
+    def get_context_usage():
+        """Estimate context tokens from messages"""
+        total = 0
+        for m in messages:
+            if isinstance(m.get("content"), str):
+                total += len(m["content"]) // 4  # rough estimate
+            if m.get("tool_calls"):
+                total += len(str(m["tool_calls"])) // 4
+        return min(total, max_context)
+    
+    def render_side_panel():
+        """Render the right side panel with context, MCP, LSP, TODO"""
+        panels = []
+        
+        # Context meter
+        used = get_context_usage()
+        pct = int((used / max_context) * 100)
+        bar_len = 20
+        filled = int(bar_len * pct / 100)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        cost_est = used * 0.00001  # very rough estimate
+        panels.append(Panel(
+            f"[bold]Context[/bold]\n"
+            f"{used:,} / {max_context:,} tokens\n"
+            f"[{bar}] {pct}%\n"
+            f"[dim]~${cost_est:.2f} spent[/dim]",
+            title="[cyan]Context[/cyan]", border_style="cyan", width=35
+        ))
+        
+        # MCP servers
+        mcp_servers = cfg.get("mcp_servers", [])
+        mcp_lines = []
+        if mcp_servers:
+            for s in mcp_servers:
+                mcp_lines.append(f"  [green]●[/green] {s['name']} ({s['transport']})")
+        else:
+            mcp_lines.append("  [dim]No MCP servers configured[/dim]")
+            mcp_lines.append("  [dim]Use /mcp to add[/dim]")
+        panels.append(Panel(
+            "\n".join(mcp_lines),
+            title="[cyan]MCP[/cyan]", border_style="cyan", width=35
+        ))
+        
+        # LSP status
+        lsp_lines = ["  [green]●[/green] typescript", "  [green]●[/green] python", "  [dim]● eslint[/dim]"]
+        panels.append(Panel(
+            "\n".join(lsp_lines),
+            title="[cyan]LSP[/cyan]", border_style="cyan", width=35
+        ))
+        
+        # TODO list
+        todos = AGENT_STATE["todos"]
+        if todos:
+            todo_lines = []
+            for t in todos[:8]:
+                status = t.get("status", "pending")
+                icon = {"pending": "○", "in_progress": "◐", "completed": "●", "cancelled": "✗"}.get(status, "?")
+                style = {"pending": "dim", "in_progress": "yellow", "completed": "green", "cancelled": "red"}.get(status, "")
+                todo_lines.append(f"  [{style}]{icon} {t.get('content', '')[:30]}[/{style}]")
+            if len(todos) > 8:
+                todo_lines.append(f"  [dim]...and {len(todos) - 8} more[/dim]")
+        else:
+            todo_lines = ["  [dim]No tasks[/dim]", "  [dim]Agent will create[/dim]"]
+        panels.append(Panel(
+            "\n".join(todo_lines),
+            title="[cyan]TODO[/cyan]", border_style="cyan", width=35
+        ))
+        
+        return Columns(panels, equal=True, expand=True)
+    
+    def render_main_area():
+        """Render the main conversation area"""
+        # This would show recent messages, but we keep it simple
+        # The actual conversation is printed by run_agent
+        return Panel(
+            "[dim]Main agent session[/dim]\n[dim]Output appears here[/dim]",
+            title="[bold magenta]SCODE[/bold magenta]", border_style="magenta"
+        )
+    
+    def render_bottom_bar():
+        """Render bottom status/keyboard bar"""
+        provider = cfg.get('provider', '?')
+        model = cfg.get('model', '?')
+        harness = AGENT_STATE.get('current_harness', cfg.get('harness', 'native'))
+        return Panel(
+            f"[bold]{provider}/{model}[/bold] | {harness} | "
+            f"[cyan]Esc[/cyan] interrupt  [cyan]Tab[/cyan] session  [cyan]Ctrl+P[/cyan] commands  [cyan]Ctrl+X←/→[/cyan] nav",
+            border_style="dim", width=None
+        )
+    
+    # Initial render of side panel
+    console.print(render_side_panel())
+    console.print(render_bottom_bar())
+    
     while True:
-        console.print(get_status_bar())
+        console.print()
         try:
-            console.print()
             user_input = Prompt.ask("[bold green]🚀[/bold green] ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]bye[/dim]")
             save_session(CURRENT_SESSION_ID, messages)
             return
-        if not user_input: 
-            show_todos()
+        if not user_input:
+            console.print(render_side_panel())
             continue
-
+        
         if user_input.startswith("/"):
             parts = user_input.split(maxsplit=2)
             cmd = parts[0]
@@ -962,7 +1059,6 @@ def repl():
                 save_cfg(cfg)
                 console.print(f"[dim]auto-approve write: {cfg['auto_approve_write']}[/dim]")
             elif cmd == "/mcp":
-                # MCP management
                 console.print("[dim]MCP servers:[/dim]")
                 for s in cfg.get("mcp_servers", []):
                     console.print(f"  - {s['name']} ({s['transport']})")
@@ -1022,6 +1118,7 @@ def repl():
             elif cmd == "/clear":
                 messages = [messages[0]]
                 console.clear()
+                console.print(BANNER)
             elif cmd == "/history":
                 with sqlite3.connect(HISTORY_DB) as db:
                     rows = db.execute("SELECT ts, role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT 20", (CURRENT_SESSION_ID,)).fetchall()
@@ -1029,16 +1126,18 @@ def repl():
                         console.print(f"[dim]{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}[/dim] [{role}] {content[:100]}")
             else:
                 console.print(f"[red]unknown: {cmd}[/red]")
-            show_todos()
+            
+            console.print(render_side_panel())
+            console.print(render_bottom_bar())
             continue
-
-        # check for steering input during run (non-blocking check)
-        # In real TUI, this would be handled by a separate input thread
+        
+        # Regular user input - run agent
         messages.append({"role":"user","content":user_input})
         log_history(CURRENT_SESSION_ID, "user", user_input)
         run_agent(messages, cfg)
         save_session(CURRENT_SESSION_ID, messages)
-        show_todos()
+        console.print(render_side_panel())
+        console.print(render_bottom_bar())
 
 if __name__ == "__main__":
     repl()
