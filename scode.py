@@ -2,7 +2,7 @@
 """Scout v2 — comprehensive CLI AI coding harness. Single file, cross-platform, no native deps.
 Capabilities: ACP, MCP, skills, harness abstraction, git-aware, steering, session persistence, plan mode, subagents.
 Runs on Linux/macOS/Windows/Android (Termux/Pydroid)."""
-import os, sys, json, re, ast, shutil, subprocess, time, argparse, signal, threading, queue, webbrowser, pathlib, textwrap, traceback, uuid, sqlite3, hashlib, inspect, tempfile, select
+import os, sys, json, re, ast, shutil, subprocess, time, argparse, signal, threading, queue, webbrowser, pathlib, textwrap, traceback, uuid, sqlite3, hashlib, inspect, tempfile, select, shlex
 from pathlib import Path
 from typing import Any, Callable, Optional
 from dataclasses import dataclass, asdict, field
@@ -50,13 +50,42 @@ CURRENT_SESSION_ID = None
 
 # --- providers ---
 PROVIDERS = {
-    "openai":    {"base": "https://api.openai.com/v1",             "models": ["gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"]},
-    "anthropic": {"base": "https://api.anthropic.com/v1",          "models": ["claude-sonnet-4-5", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"]},
-    "nvidia":    {"base": "https://integrate.api.nvidia.com/v1",   "models": ["minimaxai/minimax-m3", "meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/nemotron-3-nano-30b-a3b"]},
-    "groq":      {"base": "https://api.groq.com/openai/v1",        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]},
-    "openrouter":{"base": "https://openrouter.ai/api/v1",          "models": ["anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-2.0-flash"]},
-    "ollama":    {"base": "http://localhost:11434/v1",             "models": ["qwen2.5-coder:7b", "llama3.2", "deepseek-coder-v2", "mistral-nemo"]},
-    "lmstudio":  {"base": "http://localhost:1234/v1",              "models": ["local"]},
+    "openai": {
+        "base": "https://api.openai.com/v1",
+        "kind": "openai",
+        "models": ["gpt-4o", "gpt-4o-mini", "o3-mini"],
+    },
+    "anthropic": {
+        "base": "https://api.anthropic.com/v1",
+        "kind": "anthropic",
+        "models": ["claude-sonnet-4-5", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
+    },
+    "nvidia": {
+        "base": "https://integrate.api.nvidia.com/v1",
+        "kind": "openai",
+        "models": ["moonshotai/kimi-k2-instruct", "meta/llama-3.3-70b-instruct",
+                   "nvidia/llama-3.1-nemotron-70b-instruct"],
+    },
+    "groq": {
+        "base": "https://api.groq.com/openai/v1",
+        "kind": "openai",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    },
+    "openrouter": {
+        "base": "https://openrouter.ai/api/v1",
+        "kind": "openai",
+        "models": ["anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-2.0-flash"],
+    },
+    "ollama": {
+        "base": "http://localhost:11434/v1",
+        "kind": "openai",
+        "models": ["qwen2.5-coder:7b", "llama3.2", "deepseek-coder-v2", "mistral-nemo"],
+    },
+    "lmstudio": {
+        "base": "http://localhost:1234/v1",
+        "kind": "openai",
+        "models": ["local"],
+    },
 }
 
 HARNESSES = {
@@ -100,13 +129,23 @@ def read_file_safe(path: Path, offset: int = 1, limit: int = 2000) -> str:
     except Exception as e: return f"ERROR: {e}"
 
 def run_cmd(cmd: str, timeout: int = 60, cwd: Path = None) -> str:
+    """Run a command and preserve both stdout and stderr, including exit status."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=str(cwd or CWD))
-        out = (r.stdout + r.stderr).strip()
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=max(1, int(timeout)), cwd=str(cwd or CWD)
+        )
+        stdout = r.stdout or ""
+        stderr = r.stderr or ""
+        out = (stdout + stderr).strip()
+        if r.returncode != 0:
+            suffix = f"\\n(exit {r.returncode})"
+            out = (out + suffix).strip()
         return out[:50000] if out else f"(exit {r.returncode})"
     except subprocess.TimeoutExpired:
         return f"ERROR: timeout after {timeout}s"
-    except Exception as e: return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
 
 # --- config ---
 def load_cfg() -> dict:
@@ -136,6 +175,7 @@ def ensure_cfg() -> dict:
         choice = Prompt.ask("model", choices=[str(i) for i in range(1, len(models)+1)], default="1")
         cfg["model"] = models[int(choice)-1]
     cfg.setdefault("max_iter", 50)
+    cfg.setdefault("max_tokens", MAX_TOKENS)
     cfg.setdefault("auto_approve_shell", False)
     cfg.setdefault("auto_approve_write", True)
     cfg.setdefault("web_provider", "duckduckgo")
@@ -143,6 +183,10 @@ def ensure_cfg() -> dict:
     cfg.setdefault("harness", "native")
     cfg.setdefault("mcp_servers", [])
     cfg.setdefault("skills_enabled", [])
+    # Environment variables take precedence when the saved key is empty.
+    env_key = os.environ.get(f"{cfg.get('provider', '').upper()}_API_KEY", "")
+    if env_key and not cfg.get("api_key"):
+        cfg["api_key"] = env_key
     save_cfg(cfg)
     return cfg
 
@@ -180,7 +224,7 @@ def t_read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
 })
 def t_write_file(path: str, content: str) -> str:
     p = safe_path(path); p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content); return f"wrote {len(content)} bytes to {path}"
+    p.write_text(content, encoding="utf-8"); return f"wrote {len(content)} bytes to {path}"
 
 @tool("edit_file", "Replace exact text in a file (single occurrence).", {
     "type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]
@@ -191,7 +235,7 @@ def t_edit_file(path: str, old_string: str, new_string: str) -> str:
     text = p.read_text()
     if old_string not in text: return "ERROR: old_string not found in file"
     text = text.replace(old_string, new_string, 1)
-    p.write_text(text); return "ok"
+    p.write_text(text, encoding="utf-8"); return "ok"
 
 @tool("bash", "Run a shell command. Timeout in seconds.", {
     "type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","default":60}},"required":["command"]
@@ -271,6 +315,7 @@ def t_notebook_edit(path: str, cell_index: int, content: str, cell_type: str = "
 def t_web_search(query: str, limit: int = 5) -> str:
     try:
         r = httpx.get("https://html.duckduckgo.com/html/", params={"q": query}, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
         html = r.text
         # DuckDuckGo's HTML result markup: title link (result__a) comes first,
         # then a result__snippet block later in the same result div.
@@ -296,6 +341,7 @@ def t_web_search(query: str, limit: int = 5) -> str:
 def t_web_fetch(url: str, max_chars: int = 15000) -> str:
     try:
         r = httpx.get(url, timeout=30, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 Scout/2.0"})
+        r.raise_for_status()
         ct = r.headers.get("content-type","")
         text = r.text
         if "html" in ct:
@@ -329,7 +375,7 @@ def t_git_diff(staged: bool = False) -> str:
 
 @tool("git_commit", "Commit staged changes with message.", {"type":"object","properties":{"message":{"type":"string"}},"required":["message"]})
 def t_git_commit(message: str) -> str:
-    return run_cmd(f'git commit -m "{message}"')
+    return run_cmd(f"git commit -m {shlex.quote(message)}")
 
 @tool("git_log", "Show recent git log.", {"type":"object","properties":{"count":{"type":"integer","default":10}}})
 def t_git_log(count: int = 10) -> str:
@@ -465,59 +511,290 @@ def run_subagent(goal: str, context: str) -> str:
     return "ERROR: subagent hit max iterations"
 
 # --- LLM call ---
+def _api_error(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except Exception:
+        body = resp.text[:2000]
+    return f"HTTP {resp.status_code}: {body}"
+
+
+def _openai_headers(cfg: dict) -> dict:
+    key = cfg.get("api_key", "")
+    h = {"Content-Type": "application/json"}
+    if key:
+        h["Authorization"] = f"Bearer {key}"
+    # OpenRouter accepts these optional headers; harmless elsewhere only if absent.
+    if cfg.get("provider") == "openrouter":
+        h["HTTP-Referer"] = cfg.get("http_referer", "http://localhost")
+        h["X-Title"] = cfg.get("app_title", "Scout")
+    return h
+
+
+def _anthropic_headers(cfg: dict) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "x-api-key": cfg.get("api_key", ""),
+        "anthropic-version": "2023-06-01",
+    }
+
+
+def _messages_for_anthropic(messages: list) -> tuple[str, list]:
+    """Convert the internal OpenAI-style history to Anthropic's format."""
+    system_parts = []
+    out = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role == "system":
+            if content:
+                system_parts.append(str(content))
+            continue
+        if role == "tool":
+            # Anthropic represents tool results as a user content block.
+            out.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id", ""),
+                    "content": str(content),
+                }]
+            })
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            blocks = []
+            if content:
+                blocks.append({"type": "text", "text": str(content)})
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                try:
+                    inp = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    inp = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id") or str(uuid.uuid4()),
+                    "name": fn.get("name", ""),
+                    "input": inp,
+                })
+            out.append({"role": "assistant", "content": blocks})
+            continue
+        if role in ("user", "assistant"):
+            # Consecutive same-role messages are merged because Anthropic requires
+            # alternating user/assistant turns.
+            if not isinstance(content, list):
+                content = str(content)
+            if out and out[-1]["role"] == role:
+                existing = out[-1]["content"]
+                if isinstance(existing, list):
+                    existing.append({"type": "text", "text": content})
+                else:
+                    out[-1]["content"] = str(existing) + "\\n" + str(content)
+            else:
+                out.append({"role": role, "content": content})
+    # API requires the conversation to start with user.
+    if out and out[0]["role"] != "user":
+        out.insert(0, {"role": "user", "content": "Continue."})
+    return "\\n\\n".join(system_parts), out
+
+
+def _anthropic_tools(minimal_tools: bool) -> list:
+    result = []
+    for n, t in TOOLS.items():
+        if minimal_tools and n in {"subagent", "mcp_call", "acp_request", "git_diff",
+                                   "git_commit", "skill_load", "skill_create"}:
+            continue
+        result.append({
+            "name": n,
+            "description": t["desc"],
+            "input_schema": t["params"],
+        })
+    return result
+
+
 def call_llm(messages: list, stream: bool = True, minimal_tools: bool = False):
     cfg = load_cfg()
-    provider = cfg["provider"]; base = PROVIDERS[provider]["base"]
-    api_key = cfg.get("api_key","")
-    model = cfg["model"]
+    provider = cfg.get("provider")
+    if provider not in PROVIDERS:
+        raise RuntimeError(f"Unknown provider: {provider!r}. Run /init.")
+    meta = PROVIDERS[provider]
+    model = cfg.get("model") or meta["models"][0]
+    kind = meta.get("kind", "openai")
+
+    if kind == "anthropic":
+        system, api_messages = _messages_for_anthropic(messages)
+        payload = {
+            "model": model,
+            "max_tokens": int(cfg.get("max_tokens", MAX_TOKENS)),
+            "temperature": 0.2,
+            "system": system,
+            "messages": api_messages,
+            "tools": _anthropic_tools(minimal_tools),
+        }
+        if stream:
+            payload["stream"] = True
+        resp = httpx.post(
+            f"{meta['base']}/messages",
+            json=payload,
+            headers=_anthropic_headers(cfg),
+            timeout=300,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(_api_error(resp))
+        return stream_anthropic(resp) if stream else parse_anthropic_response(resp.json())
 
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": int(cfg.get("max_tokens", MAX_TOKENS)),
         "temperature": 0.2,
-        "stream": stream,
+        "stream": bool(stream),
         "tools": tool_schema(minimal_tools),
         "tool_choice": "auto",
     }
-    headers = {"Content-Type":"application/json","Authorization":f"Bearer {api_key}"}
+    # Some local OpenAI-compatible servers reject tools entirely.
+    if cfg.get("disable_tools"):
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
 
-    if stream:
-        return stream_response(httpx.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=300))
-    else:
-        r = httpx.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=300)
-        r.raise_for_status()
-        d = r.json()
-        msg = d["choices"][0]["message"]
-        return msg.get("content","") or "", msg.get("tool_calls") or []
+    resp = httpx.post(
+        f"{meta['base']}/chat/completions",
+        json=payload,
+        headers=_openai_headers(cfg),
+        timeout=300,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_api_error(resp))
+    return stream_response(resp) if stream else parse_openai_response(resp.json())
 
-def stream_response(resp):
+
+def parse_openai_response(d: dict):
+    choices = d.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"Provider returned no choices: {json.dumps(d)[:2000]}")
+    msg = choices[0].get("message") or {}
+    return msg.get("content") or "", msg.get("tool_calls") or []
+
+
+def stream_response(resp: httpx.Response):
+    """Parse SSE from OpenAI-compatible APIs, with a non-SSE fallback."""
     text_buf = ""
     tool_calls = {}
-    for line in resp.iter_lines():
-        if not line or not line.startswith("data: "): continue
-        data = line[6:]
-        if data.strip() == "[DONE]": break
-        try: d = json.loads(data)
-        except: continue
+
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/event-stream" not in content_type:
+        try:
+            return parse_openai_response(resp.json())
+        except Exception:
+            body = resp.text[:5000]
+            raise RuntimeError(f"Provider returned an unexpected response: {body}")
+
+    for raw in resp.iter_lines():
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        if not line:
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            d = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if "error" in d:
+            raise RuntimeError(json.dumps(d["error"]))
         choices = d.get("choices") or []
-        if not choices: continue
-        delta = choices[0].get("delta", {})
-        if "content" in delta and delta["content"]:
-            text_buf += delta["content"]
-            console.print(delta["content"], end="")
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        piece = delta.get("content")
+        if piece:
+            text_buf += str(piece)
+            # Use Text so model-generated Rich markup cannot corrupt the TUI.
+            console.print(Text(str(piece)), end="")
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
             if idx not in tool_calls:
-                tool_calls[idx] = {"id": tc.get("id",""), "function":{"name":"","arguments":""}}
-            if tc.get("id"): tool_calls[idx]["id"] = tc["id"]
-            if tc.get("function",{}).get("name"): tool_calls[idx]["function"]["name"] += tc["function"]["name"]
-            if tc.get("function",{}).get("arguments"): tool_calls[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                tool_calls[idx] = {
+                    "id": tc.get("id") or str(uuid.uuid4()),
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+            if tc.get("id"):
+                tool_calls[idx]["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                tool_calls[idx]["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+
+    return text_buf, [tool_calls[i] for i in sorted(tool_calls)]
+
+
+def parse_anthropic_response(d: dict):
+    text = []
     calls = []
-    for i in sorted(tool_calls):
-        c = tool_calls[i]
-        calls.append({"id": c["id"], "type":"function", "function": c["function"]})
-    return text_buf, calls
+    for block in d.get("content", []):
+        if block.get("type") == "text":
+            text.append(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            calls.append({
+                "id": block.get("id") or str(uuid.uuid4()),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {})),
+                },
+            })
+    return "".join(text), calls
+
+
+def stream_anthropic(resp: httpx.Response):
+    text_buf = ""
+    calls = {}
+    content_type = resp.headers.get("content-type", "").lower()
+
+    if "text/event-stream" not in content_type:
+        return parse_anthropic_response(resp.json())
+
+    current_tool = None
+    for raw in resp.iter_lines():
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+
+        etype = event.get("type")
+        if etype == "error":
+            raise RuntimeError(json.dumps(event.get("error", event)))
+        if etype == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                current_tool = block.get("id") or str(uuid.uuid4())
+                calls[current_tool] = {
+                    "id": current_tool, "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": "",
+                    },
+                }
+        elif etype == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                piece = delta.get("text", "")
+                text_buf += piece
+                console.print(Text(piece), end="")
+            elif delta.get("type") == "input_json_delta" and current_tool:
+                calls[current_tool]["function"]["arguments"] += delta.get("partial_json", "")
+        elif etype == "content_block_stop":
+            current_tool = None
+
+    return text_buf, list(calls.values())
+
 
 # --- approval ---
 def confirm_tool(name: str, args: dict) -> bool:
@@ -534,9 +811,17 @@ def confirm_tool(name: str, args: dict) -> bool:
 
 # --- session persistence ---
 def save_session(session_id: str, messages: list, title: str = ""):
+    now = time.time()
     with sqlite3.connect(SESSIONS_DB) as db:
-        db.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?)",
-            (session_id, time.time(), time.time(), title or f"Session {session_id[:8]}", json.dumps(messages)))
+        db.execute(
+            """INSERT INTO sessions(id, created, updated, title, messages)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   updated=excluded.updated,
+                   title=CASE WHEN excluded.title != '' THEN excluded.title ELSE sessions.title END,
+                   messages=excluded.messages""",
+            (session_id, now, now, title, json.dumps(messages)),
+        )
 
 def load_session(session_id: str) -> Optional[list]:
     with sqlite3.connect(SESSIONS_DB) as db:
@@ -586,9 +871,9 @@ def t_image_describe(image_path: str) -> str:
 def t_git_worktree_add(path: str, branch: str = "") -> str:
     """Add a git worktree for isolated development."""
     p = safe_path(path)
-    cmd = f"git worktree add {p}"
+    cmd = f"git worktree add {shlex.quote(str(p))}"
     if branch:
-        cmd += f" {branch}"
+        cmd += f" {shlex.quote(branch)}"
     return run_cmd(cmd)
 
 @tool("git_worktree_list", "List git worktrees.", {
@@ -604,7 +889,7 @@ def t_git_worktree_list() -> str:
 def t_git_worktree_remove(path: str) -> str:
     """Remove a git worktree."""
     p = safe_path(path)
-    return run_cmd(f"git worktree remove {p}")
+    return run_cmd(f"git worktree remove {shlex.quote(str(p))}")
 
 # --- test execution tools (Codex-like) ---
 @tool("test_run", "Run tests. command=string (e.g., 'pytest', 'npm test', 'go test').", {
@@ -757,17 +1042,23 @@ def t_context_compact(keep_last: int = 5) -> str:
     if len(messages) <= keep_last + 2:  # +2 for system and maybe one other
         return f"(history only {len(messages)} messages, no compaction needed)"
 
-    # Keep system message and last N messages
     system_msgs = [m for m in messages if m.get("role") == "system"]
-    recent_msgs = messages[-(keep_last):] if len(messages) > keep_last else []
+    non_system = [m for m in messages if m.get("role") != "system"]
+    recent_msgs = non_system[-keep_last:] if keep_last > 0 else []
 
-    # What we're removing
-    removed_count = len(messages) - len(system_msgs) - len(recent_msgs)
+    # If the tail starts with tool results, retain the preceding assistant
+    # tool-call message(s) so the provider receives a valid conversation.
+    while recent_msgs and recent_msgs[0].get("role") == "tool":
+        idx = non_system.index(recent_msgs[0])
+        if idx <= 0:
+            break
+        recent_msgs.insert(0, non_system[idx - 1])
+        if recent_msgs[0].get("role") != "tool":
+            break
 
-    # Rebuild messages in place (mutate the list the caller holds a reference to)
+    old_len = len(messages)
     messages[:] = system_msgs + recent_msgs
-
-    return f"compacted context: removed {removed_count} messages, kept {len(messages)}"
+    return f"compacted context: removed {old_len - len(messages)} messages, kept {len(messages)}"
 
 # --- long running task helpers (Codex-like) ---
 @tool("task_breakdown", "Break down a complex task into steps. goal=string.", {
@@ -794,50 +1085,87 @@ def run_agent(messages: list, cfg: dict):
     global CURRENT_SESSION_ID
     AGENT_STATE["active_messages"] = messages
     minimal = cfg.get("harness") == "minimal"
+
+    mutating_tools = {
+        "write_file", "edit_file", "bash", "notebook_edit", "git_commit",
+        "git_worktree_add", "git_worktree_remove", "agents_write",
+        "skill_create", "mcp_call", "acp_request",
+    }
+
     for it in range(cfg.get("max_iter", 50)):
         if AGENT_STATE["interrupted"]:
             AGENT_STATE["interrupted"] = False
             console.print("[yellow]interrupted[/yellow]")
             return
+
         if AGENT_STATE["steering_queue"]:
             steer = AGENT_STATE["steering_queue"].pop(0)
-            messages.append({"role":"user","content":steer})
+            messages.append({"role": "user", "content": steer})
+            log_history(CURRENT_SESSION_ID, "user", steer)
             console.print(f"[cyan]steer:[/cyan] {steer}")
 
         console.print(f"\n[dim]── iter {it+1} ──[/dim]")
         try:
             text, calls = call_llm(messages, stream=True, minimal_tools=minimal)
-        except httpx.HTTPStatusError as e:
-            console.print(f"[red]HTTP {e.response.status_code}: {e.response.text[:300]}[/red]")
-            return
         except Exception as e:
-            console.print(f"[red]error: {e}[/red]"); traceback.print_exc(); return
+            console.print(f"[red]LLM error: {e}[/red]")
+            return
+
+        # Critical fix: preserve every assistant response, including responses
+        # that contain no tool calls. The original implementation discarded it.
+        assistant_msg = {"role": "assistant", "content": text or ""}
+        if calls:
+            assistant_msg["tool_calls"] = calls
+        messages.append(assistant_msg)
+        log_history(CURRENT_SESSION_ID, "assistant", text or "", calls)
 
         if not calls:
-            console.print()
+            if text:
+                console.print()
+            else:
+                console.print("[yellow](model returned an empty response)[/yellow]")
             return
 
-        messages.append({"role":"assistant","content":text or "","tool_calls":calls})
-        log_history(CURRENT_SESSION_ID, "assistant", text or "", calls)
         for c in calls:
-            name = c["function"]["name"]
-            try: args = json.loads(c["function"]["arguments"])
-            except: args = {}
-            if not confirm_tool(name, args):
-                messages.append({"role":"tool","tool_call_id":c["id"],"content":"DENIED by user"})
-                log_history(CURRENT_SESSION_ID, "tool", "DENIED", [{"name":name,"args":args}])
-                continue
-            t0 = time.time()
+            name = c.get("function", {}).get("name", "")
+            raw_args = c.get("function", {}).get("arguments", "{}")
             try:
-                out = TOOLS[name]["fn"](**args)
-            except Exception as e:
-                out = f"ERROR: {e}\n{traceback.format_exc()[-500:]}"
-            dt = time.time() - t0
-            preview = str(out)[:200].replace("\n"," ")
-            console.print(f"  [dim]→[/dim] [cyan]{name}[/cyan] [dim]({dt:.1f}s)[/dim] {preview}{'...' if len(str(out))>200 else ''}")
-            messages.append({"role":"tool","tool_call_id":c["id"],"content":str(out)})
-            log_history(CURRENT_SESSION_ID, "tool", str(out), [{"name":name,"args":args,"result":str(out)[:500]}])
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except json.JSONDecodeError as e:
+                out = f"ERROR: invalid tool arguments for {name}: {e}"
+                messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": out})
+                log_history(CURRENT_SESSION_ID, "tool", out)
+                console.print(f"  [red]→ {name}: {out}[/red]")
+                continue
+
+            if name not in TOOLS:
+                out = f"ERROR: unknown tool '{name}'"
+            elif AGENT_STATE["plan_mode"] and name in mutating_tools:
+                out = f"BLOCKED: plan mode is read-only; tool '{name}' was not executed."
+            elif not confirm_tool(name, args):
+                out = "DENIED by user"
+            else:
+                t0 = time.time()
+                try:
+                    out = TOOLS[name]["fn"](**args)
+                except Exception as e:
+                    out = f"ERROR: {e}\n{traceback.format_exc()[-1000:]}"
+                dt = time.time() - t0
+
+            preview = str(out)[:200].replace("\n", " ")
+            elapsed = f" ({time.time() - t0:.1f}s)" if "t0" in locals() else ""
+            console.print(f"  [dim]→[/dim] [cyan]{name or '?'}[/cyan][dim]{elapsed}[/dim] {preview}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": c.get("id") or str(uuid.uuid4()),
+                "content": str(out),
+            })
+            log_history(CURRENT_SESSION_ID, "tool", str(out), [{
+                "name": name, "args": args, "result": str(out)[:500]
+            }])
+
     console.print("[yellow]hit max_iter[/yellow]")
+
 
 # --- TUI helpers ---
 def show_todos():
@@ -1138,6 +1466,23 @@ def repl():
                     rows = db.execute("SELECT ts, role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT 20", (CURRENT_SESSION_ID,)).fetchall()
                     for ts, role, content in reversed(rows):
                         console.print(f"[dim]{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}[/dim] [{role}] {content[:100]}")
+            elif cmd == "/health":
+                try:
+                    cfg_test = load_cfg()
+                    provider_test = cfg_test.get("provider")
+                    meta_test = PROVIDERS.get(provider_test)
+                    if not meta_test:
+                        raise RuntimeError(f"unknown provider: {provider_test}")
+                    if meta_test.get("kind") == "anthropic":
+                        rr = httpx.get(meta_test["base"] + "/models", headers=_anthropic_headers(cfg_test), timeout=15)
+                    else:
+                        rr = httpx.get(meta_test["base"] + "/models", headers=_openai_headers(cfg_test), timeout=15)
+                    if rr.status_code < 400:
+                        console.print(f"[green]provider reachable: {provider_test}[/green]")
+                    else:
+                        console.print(f"[red]{_api_error(rr)}[/red]")
+                except Exception as e:
+                    console.print(f"[red]health error: {e}[/red]")
             else:
                 console.print(f"[red]unknown: {cmd}[/red]")
             
