@@ -53,38 +53,44 @@ PROVIDERS = {
     "openai": {
         "base": "https://api.openai.com/v1",
         "kind": "openai",
-        "models": ["gpt-4o", "gpt-4o-mini", "o3-mini"],
+        "models": [],
+        "requires_key": True,
     },
     "anthropic": {
         "base": "https://api.anthropic.com/v1",
         "kind": "anthropic",
-        "models": ["claude-sonnet-4-5", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
+        "models": [],
+        "requires_key": True,
     },
     "nvidia": {
         "base": "https://integrate.api.nvidia.com/v1",
         "kind": "openai",
-        "models": ["moonshotai/kimi-k2-instruct", "meta/llama-3.3-70b-instruct",
-                   "nvidia/llama-3.1-nemotron-70b-instruct"],
+        "models": [],
+        "requires_key": True,
     },
     "groq": {
         "base": "https://api.groq.com/openai/v1",
         "kind": "openai",
-        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        "models": [],
+        "requires_key": True,
     },
     "openrouter": {
         "base": "https://openrouter.ai/api/v1",
         "kind": "openai",
-        "models": ["anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-2.0-flash"],
+        "models": [],
+        "requires_key": True,
     },
     "ollama": {
         "base": "http://localhost:11434/v1",
         "kind": "openai",
-        "models": ["qwen2.5-coder:7b", "llama3.2", "deepseek-coder-v2", "mistral-nemo"],
+        "models": [],
+        "requires_key": False,
     },
     "lmstudio": {
         "base": "http://localhost:1234/v1",
         "kind": "openai",
-        "models": ["local"],
+        "models": [],
+        "requires_key": False,
     },
 }
 
@@ -147,33 +153,325 @@ def run_cmd(cmd: str, timeout: int = 60, cwd: Path = None) -> str:
     except Exception as e:
         return f"ERROR: {e}"
 
-# --- config ---
+# --- config / provider discovery ---
 def load_cfg() -> dict:
     if CFG_PATH.exists():
-        try: return json.loads(CFG_PATH.read_text())
-        except: pass
+        try:
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
     return {}
 
-def save_cfg(cfg: dict):
-    CFG_PATH.write_text(json.dumps(cfg, indent=2))
 
-def ensure_cfg() -> dict:
+def save_cfg(cfg: dict):
+    CFG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _provider_env_key(provider: str) -> str:
+    return {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "nvidia": "NVIDIA_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "ollama": "OLLAMA_API_KEY",
+        "lmstudio": "LMSTUDIO_API_KEY",
+    }.get(provider, f"{provider.upper()}_API_KEY")
+
+
+def _api_error(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except Exception:
+        body = resp.text[:2000]
+    if isinstance(body, dict) and "error" in body:
+        err = body["error"]
+        if isinstance(err, dict):
+            message = err.get("message") or err.get("detail") or str(err)
+            code = err.get("code")
+            return f"HTTP {resp.status_code}: {message}" + (f" (code={code})" if code else "")
+        return f"HTTP {resp.status_code}: {err}"
+    return f"HTTP {resp.status_code}: {body}"
+
+
+def _openai_headers(cfg: dict) -> dict:
+    key = cfg.get("api_key", "")
+    h = {"Content-Type": "application/json", "Accept": "application/json"}
+    if key:
+        h["Authorization"] = f"Bearer {key}"
+    if cfg.get("provider") == "openrouter":
+        h["HTTP-Referer"] = cfg.get("http_referer", "http://localhost")
+        h["X-Title"] = cfg.get("app_title", "SCODE")
+    return h
+
+
+def _anthropic_headers(cfg: dict) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-api-key": cfg.get("api_key", ""),
+        "anthropic-version": "2023-06-01",
+    }
+
+
+def _request(method: str, url: str, *, headers=None, json_body=None,
+             timeout=30, retries=3, stream=False) -> httpx.Response:
+    """Network layer with sane retry policy.
+
+    401/403 are never blindly retried. They are authentication/authorization
+    failures and must be handled by refreshing the model catalog or credentials.
+    429 and transient 5xx errors are retried with bounded exponential backoff.
+    """
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            r = httpx.request(
+                method, url, headers=headers or {}, json=json_body,
+                timeout=timeout, follow_redirects=True,
+            )
+            if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < retries:
+                retry_after = r.headers.get("retry-after")
+                try:
+                    delay = min(8.0, max(0.25, float(retry_after)))
+                except Exception:
+                    delay = min(8.0, 0.5 * (2 ** attempt))
+                time.sleep(delay)
+                last = r
+                continue
+            return r
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            last = e
+            if attempt + 1 >= retries:
+                raise RuntimeError(f"network error contacting provider: {e}") from e
+            time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+    if isinstance(last, httpx.Response):
+        return last
+    raise RuntimeError(f"request failed: {last}")
+
+
+def _normalize_model(item: dict, provider: str) -> dict:
+    mid = str(item.get("id") or item.get("name") or "").strip()
+    architecture = item.get("architecture") or {}
+    supported = item.get("supported_parameters") or []
+    if isinstance(supported, dict):
+        supported = list(supported)
+    modality = str(architecture.get("modality") or "").lower()
+    explicit_tool_support = any(
+        x in {"tools", "tool_choice", "function_call", "structured_outputs"}
+        or "tool" in str(x).lower()
+        for x in supported
+    )
+    # Several official /models endpoints do not expose capability metadata.
+    # Treat ordinary chat models as tool-capable until the provider says otherwise;
+    # OpenRouter exposes the detailed supported_parameters field when available.
+    tool_calling = explicit_tool_support if supported else provider not in {"ollama", "lmstudio"}
+    return {
+        "id": mid,
+        "name": str(item.get("name") or mid),
+        "context_length": item.get("context_length") or item.get("context_window"),
+        "description": str(item.get("description") or ""),
+        "owned_by": str(item.get("owned_by") or architecture.get("tokenizer") or ""),
+        "modality": modality,
+        "tool_calling": tool_calling,
+        "raw": item,
+    }
+
+
+def _is_usable_agent_model(m: dict) -> bool:
+    mid = m["id"].lower()
+    blocked = (
+        "embedding", "rerank", "moderation", "tts", "transcribe",
+        "whisper", "image-generation", "image-generation",
+    )
+    if any(x in mid for x in blocked):
+        return False
+    modality = m.get("modality", "")
+    if modality and ("text" not in modality and "text->text" not in modality):
+        return False
+    return bool(m["id"])
+
+
+def fetch_models(cfg: dict, force: bool = False) -> list[dict]:
+    """Fetch the provider's current model catalog after authorization."""
+    provider = cfg.get("provider")
+    meta = PROVIDERS.get(provider)
+    if not meta:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
+    key = cfg.get("api_key", "")
+    if meta.get("requires_key") and not key:
+        raise RuntimeError(f"{provider} requires an API key before models can be fetched.")
+
+    # Local providers use OpenAI-compatible /v1/models. Ollama also has a native
+    # endpoint, but /v1/models is preferable because it matches the chat API.
+    url = meta["base"].rstrip("/") + "/models"
+    headers = _anthropic_headers(cfg) if meta["kind"] == "anthropic" else _openai_headers(cfg)
+    resp = _request("GET", url, headers=headers, timeout=20, retries=2)
+
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            _api_error(resp) +
+            ". The provider rejected authorization/model access; SCODE will not "
+            "blindly send chat requests with an unverified model."
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(_api_error(resp))
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"provider returned invalid JSON from /models: {e}")
+
+    raw = data.get("data", data.get("models", []))
+    if not isinstance(raw, list):
+        raise RuntimeError("provider /models response did not contain a model list")
+
+    models = [_normalize_model(x, provider) for x in raw if isinstance(x, dict)]
+    models = [m for m in models if _is_usable_agent_model(m)]
+
+    # Deduplicate by model id while preserving provider order.
+    unique = {}
+    for m in models:
+        unique.setdefault(m["id"], m)
+    models = list(unique.values())
+    if not models:
+        raise RuntimeError("authorization succeeded, but the provider returned no usable text models")
+
+    cfg["model_catalog"] = models
+    cfg["model_catalog_at"] = time.time()
+    save_cfg(cfg)
+    return models
+
+
+def get_cached_models(cfg: dict) -> list[dict]:
+    models = cfg.get("model_catalog")
+    if isinstance(models, list):
+        return [m for m in models if isinstance(m, dict) and m.get("id")]
+    return []
+
+
+def select_model(cfg: dict, models: list[dict] | None = None) -> str:
+    models = models or get_cached_models(cfg)
+    if not models:
+        models = fetch_models(cfg)
+
+    current = cfg.get("model", "")
+    while True:
+        console.print(
+            f"[cyan]Model search[/cyan] — {len(models)} available. "
+            "Type a search term, exact model ID, or number. Blank keeps current."
+        )
+        query = Prompt.ask("model", default=current or "").strip()
+        if not query:
+            if current and any(m["id"] == current for m in models):
+                return current
+            query = "*"
+
+        if query == "*":
+            matches = models[:30]
+        elif query.isdigit():
+            n = int(query)
+            if 1 <= n <= len(models):
+                return models[n - 1]["id"]
+            console.print("[red]invalid model number[/red]")
+            continue
+        else:
+            q = query.lower()
+            matches = [
+                m for m in models
+                if q in m["id"].lower()
+                or q in m.get("name", "").lower()
+                or q in m.get("description", "").lower()
+            ]
+
+        if not matches:
+            console.print("[yellow]no matching models[/yellow]")
+            continue
+
+        table = Table(title=f"Models ({len(matches)} matches)", show_header=True)
+        table.add_column("#", width=5)
+        table.add_column("Model")
+        table.add_column("Tools", width=7)
+        table.add_column("Context", width=12)
+        for i, m in enumerate(matches[:40], 1):
+            ctx = m.get("context_length")
+            ctx_text = f"{int(ctx):,}" if isinstance(ctx, (int, float)) else "-"
+            tools_text = "yes" if m.get("tool_calling") else "no"
+            table.add_row(str(i), m["id"], tools_text, ctx_text)
+        console.print(table)
+
+        choice = Prompt.ask("select # / refine search", default="1").strip()
+        if choice.isdigit() and 1 <= int(choice) <= min(40, len(matches)):
+            return matches[int(choice) - 1]["id"]
+        query = choice
+
+
+def ensure_cfg(non_interactive: bool = False) -> dict:
     cfg = load_cfg()
-    if "provider" not in cfg:
-        console.print("[bold cyan]Scout setup[/bold cyan]")
-        names = list(PROVIDERS)
-        for i, n in enumerate(names, 1):
-            console.print(f"  [cyan]{i}[/cyan] {n}")
-        choice = Prompt.ask("provider", choices=[str(i) for i in range(1, len(names)+1)], default="1")
-        cfg["provider"] = names[int(choice)-1]
-    if "api_key" not in cfg:
-        cfg["api_key"] = Prompt.ask(f"api key for [cyan]{cfg['provider']}[/cyan] (blank to skip)", default="")
-    if "model" not in cfg:
-        models = PROVIDERS[cfg["provider"]]["models"]
-        for i, m in enumerate(models, 1):
-            console.print(f"  [cyan]{i}[/cyan] {m}")
-        choice = Prompt.ask("model", choices=[str(i) for i in range(1, len(models)+1)], default="1")
-        cfg["model"] = models[int(choice)-1]
+    if "provider" not in cfg or cfg["provider"] not in PROVIDERS:
+        if non_interactive:
+            # Use first provider that has an env key, or default to nvidia
+            for p in ["nvidia", "openai", "anthropic", "groq", "openrouter", "ollama", "lmstudio"]:
+                if p in PROVIDERS and (not PROVIDERS[p].get("requires_key") or os.environ.get(_provider_env_key(p))):
+                    cfg["provider"] = p
+                    break
+            else:
+                cfg["provider"] = "nvidia"
+        else:
+            console.print("[bold cyan]SCOUT provider setup[/bold cyan]")
+            names = list(PROVIDERS)
+            for i, n in enumerate(names, 1):
+                console.print(f"  [cyan]{i}[/cyan] {n}")
+            choice = Prompt.ask("provider", choices=[str(i) for i in range(1, len(names)+1)], default="1")
+            cfg["provider"] = names[int(choice)-1]
+
+    meta = PROVIDERS[cfg["provider"]]
+    if meta.get("requires_key"):
+        env_key = os.environ.get(_provider_env_key(cfg["provider"]), "")
+        if env_key and not cfg.get("api_key"):
+            cfg["api_key"] = env_key
+        if not cfg.get("api_key"):
+            if non_interactive:
+                raise RuntimeError(f"API key required for {cfg['provider']} in non-interactive mode. Set {_provider_env_key(cfg['provider'])} env var.")
+            cfg["api_key"] = Prompt.ask(
+                f"API key for [cyan]{cfg['provider']}[/cyan]",
+                password=True,
+                default="",
+            )
+
+    # Authorization happens before model selection. The selected model therefore
+    # comes from the provider's current catalog instead of stale hardcoded IDs.
+    try:
+        models = fetch_models(cfg)
+        console.print(f"[green]Authorized — fetched {len(models)} usable models.[/green]")
+        if non_interactive:
+            # In non-interactive mode, just use the first model or current
+            current = cfg.get("model", "")
+            if current and any(m["id"] == current for m in models):
+                pass  # keep current
+            else:
+                cfg["model"] = models[0]["id"]
+        else:
+            cfg["model"] = select_model(cfg, models)
+    except Exception as e:
+        console.print(f"[red]Model discovery failed: {e}[/red]")
+        cached = get_cached_models(cfg)
+        if cached:
+            console.print(f"[yellow]Using cached catalog ({len(cached)} models).[/yellow]")
+            if non_interactive:
+                current = cfg.get("model", "")
+                if current and any(m["id"] == current for m in cached):
+                    pass
+                else:
+                    cfg["model"] = cached[0]["id"]
+            else:
+                cfg["model"] = select_model(cfg, cached)
+        elif not cfg.get("model"):
+            raise RuntimeError(
+                "Cannot start safely without a verified model. Fix the provider/API key first."
+            )
+
     cfg.setdefault("max_iter", 50)
     cfg.setdefault("max_tokens", MAX_TOKENS)
     cfg.setdefault("auto_approve_shell", False)
@@ -183,10 +481,7 @@ def ensure_cfg() -> dict:
     cfg.setdefault("harness", "native")
     cfg.setdefault("mcp_servers", [])
     cfg.setdefault("skills_enabled", [])
-    # Environment variables take precedence when the saved key is empty.
-    env_key = os.environ.get(f"{cfg.get('provider', '').upper()}_API_KEY", "")
-    if env_key and not cfg.get("api_key"):
-        cfg["api_key"] = env_key
+    cfg.setdefault("disable_tools", False)
     save_cfg(cfg)
     return cfg
 
@@ -511,36 +806,15 @@ def run_subagent(goal: str, context: str) -> str:
     return "ERROR: subagent hit max iterations"
 
 # --- LLM call ---
-def _api_error(resp: httpx.Response) -> str:
-    try:
-        body = resp.json()
-    except Exception:
-        body = resp.text[:2000]
-    return f"HTTP {resp.status_code}: {body}"
-
-
-def _openai_headers(cfg: dict) -> dict:
-    key = cfg.get("api_key", "")
-    h = {"Content-Type": "application/json"}
-    if key:
-        h["Authorization"] = f"Bearer {key}"
-    # OpenRouter accepts these optional headers; harmless elsewhere only if absent.
-    if cfg.get("provider") == "openrouter":
-        h["HTTP-Referer"] = cfg.get("http_referer", "http://localhost")
-        h["X-Title"] = cfg.get("app_title", "Scout")
-    return h
-
-
-def _anthropic_headers(cfg: dict) -> dict:
-    return {
-        "Content-Type": "application/json",
-        "x-api-key": cfg.get("api_key", ""),
-        "anthropic-version": "2023-06-01",
-    }
+def _selected_model(cfg: dict) -> dict:
+    model = cfg.get("model", "")
+    for m in get_cached_models(cfg):
+        if m.get("id") == model:
+            return m
+    return {"id": model, "tool_calling": True}
 
 
 def _messages_for_anthropic(messages: list) -> tuple[str, list]:
-    """Convert the internal OpenAI-style history to Anthropic's format."""
     system_parts = []
     out = []
     for m in messages:
@@ -551,15 +825,11 @@ def _messages_for_anthropic(messages: list) -> tuple[str, list]:
                 system_parts.append(str(content))
             continue
         if role == "tool":
-            # Anthropic represents tool results as a user content block.
-            out.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": m.get("tool_call_id", ""),
-                    "content": str(content),
-                }]
-            })
+            out.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": m.get("tool_call_id", ""),
+                "content": str(content),
+            }]})
             continue
         if role == "assistant" and m.get("tool_calls"):
             blocks = []
@@ -580,22 +850,16 @@ def _messages_for_anthropic(messages: list) -> tuple[str, list]:
             out.append({"role": "assistant", "content": blocks})
             continue
         if role in ("user", "assistant"):
-            # Consecutive same-role messages are merged because Anthropic requires
-            # alternating user/assistant turns.
-            if not isinstance(content, list):
-                content = str(content)
             if out and out[-1]["role"] == role:
-                existing = out[-1]["content"]
-                if isinstance(existing, list):
-                    existing.append({"type": "text", "text": content})
+                if isinstance(out[-1]["content"], list):
+                    out[-1]["content"].append({"type": "text", "text": str(content)})
                 else:
-                    out[-1]["content"] = str(existing) + "\\n" + str(content)
+                    out[-1]["content"] = str(out[-1]["content"]) + "\n" + str(content)
             else:
                 out.append({"role": role, "content": content})
-    # API requires the conversation to start with user.
     if out and out[0]["role"] != "user":
         out.insert(0, {"role": "user", "content": "Continue."})
-    return "\\n\\n".join(system_parts), out
+    return "\n\n".join(system_parts), out
 
 
 def _anthropic_tools(minimal_tools: bool) -> list:
@@ -604,12 +868,26 @@ def _anthropic_tools(minimal_tools: bool) -> list:
         if minimal_tools and n in {"subagent", "mcp_call", "acp_request", "git_diff",
                                    "git_commit", "skill_load", "skill_create"}:
             continue
-        result.append({
-            "name": n,
-            "description": t["desc"],
-            "input_schema": t["params"],
-        })
+        result.append({"name": n, "description": t["desc"], "input_schema": t["params"]})
     return result
+
+
+def _post_chat(cfg: dict, payload: dict, stream: bool):
+    meta = PROVIDERS[cfg["provider"]]
+    kind = meta.get("kind", "openai")
+    if kind == "anthropic":
+        url = meta["base"].rstrip("/") + "/messages"
+        headers = _anthropic_headers(cfg)
+    else:
+        url = meta["base"].rstrip("/") + "/chat/completions"
+        headers = _openai_headers(cfg)
+
+    resp = _request("POST", url, headers=headers, json_body=payload,
+                    timeout=300, retries=3, stream=stream)
+
+    if resp.status_code >= 400:
+        raise RuntimeError(_api_error(resp))
+    return resp
 
 
 def call_llm(messages: list, stream: bool = True, minimal_tools: bool = False):
@@ -617,8 +895,10 @@ def call_llm(messages: list, stream: bool = True, minimal_tools: bool = False):
     provider = cfg.get("provider")
     if provider not in PROVIDERS:
         raise RuntimeError(f"Unknown provider: {provider!r}. Run /init.")
+
     meta = PROVIDERS[provider]
-    model = cfg.get("model") or meta["models"][0]
+    model_meta = _selected_model(cfg)
+    model = cfg.get("model") or model_meta["id"]
     kind = meta.get("kind", "openai")
 
     if kind == "anthropic":
@@ -629,46 +909,64 @@ def call_llm(messages: list, stream: bool = True, minimal_tools: bool = False):
             "temperature": 0.2,
             "system": system,
             "messages": api_messages,
-            "tools": _anthropic_tools(minimal_tools),
         }
+        # Only send tools when the selected model is known to support them.
+        if not cfg.get("disable_tools") and model_meta.get("tool_calling", True):
+            payload["tools"] = _anthropic_tools(minimal_tools)
         if stream:
             payload["stream"] = True
-        resp = httpx.post(
-            f"{meta['base']}/messages",
-            json=payload,
-            headers=_anthropic_headers(cfg),
-            timeout=300,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(_api_error(resp))
+
+        try:
+            resp = _post_chat(cfg, payload, stream)
+        except RuntimeError as e:
+            # 403/permission errors can happen if a stale model was saved.
+            # Refresh the provider catalog once, switch only if necessary,
+            # then retry exactly once.
+            if "HTTP 403" in str(e) or "HTTP 404" in str(e):
+                try:
+                    models = fetch_models(cfg, force=True)
+                    ids = {m["id"] for m in models}
+                    if model not in ids:
+                        cfg["model"] = models[0]["id"]
+                        save_cfg(cfg)
+                        return call_llm(messages, stream=stream, minimal_tools=minimal_tools)
+                except Exception:
+                    pass
+            raise
         return stream_anthropic(resp) if stream else parse_anthropic_response(resp.json())
 
+    tools_enabled = not cfg.get("disable_tools") and model_meta.get("tool_calling", True)
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": int(cfg.get("max_tokens", MAX_TOKENS)),
         "temperature": 0.2,
         "stream": bool(stream),
-        "tools": tool_schema(minimal_tools),
-        "tool_choice": "auto",
     }
-    # Some local OpenAI-compatible servers reject tools entirely.
-    if cfg.get("disable_tools"):
-        payload.pop("tools", None)
-        payload.pop("tool_choice", None)
+    if tools_enabled:
+        payload["tools"] = tool_schema(minimal_tools)
+        payload["tool_choice"] = "auto"
 
-    resp = httpx.post(
-        f"{meta['base']}/chat/completions",
-        json=payload,
-        headers=_openai_headers(cfg),
-        timeout=300,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(_api_error(resp))
+    try:
+        resp = _post_chat(cfg, payload, stream)
+    except RuntimeError as e:
+        if "HTTP 403" in str(e) or "HTTP 404" in str(e):
+            try:
+                models = fetch_models(cfg, force=True)
+                ids = {m["id"] for m in models}
+                if model not in ids:
+                    cfg["model"] = models[0]["id"]
+                    save_cfg(cfg)
+                    return call_llm(messages, stream=stream, minimal_tools=minimal_tools)
+            except Exception:
+                pass
+        raise
     return stream_response(resp) if stream else parse_openai_response(resp.json())
 
 
 def parse_openai_response(d: dict):
+    if "error" in d:
+        raise RuntimeError(str(d["error"]))
     choices = d.get("choices") or []
     if not choices:
         raise RuntimeError(f"Provider returned no choices: {json.dumps(d)[:2000]}")
@@ -677,23 +975,15 @@ def parse_openai_response(d: dict):
 
 
 def stream_response(resp: httpx.Response):
-    """Parse SSE from OpenAI-compatible APIs, with a non-SSE fallback."""
     text_buf = ""
     tool_calls = {}
-
     content_type = resp.headers.get("content-type", "").lower()
     if "text/event-stream" not in content_type:
-        try:
-            return parse_openai_response(resp.json())
-        except Exception:
-            body = resp.text[:5000]
-            raise RuntimeError(f"Provider returned an unexpected response: {body}")
+        return parse_openai_response(resp.json())
 
     for raw in resp.iter_lines():
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-        if not line:
-            continue
-        if not line.startswith("data:"):
+        if not line or not line.startswith("data:"):
             continue
         data = line[5:].strip()
         if data == "[DONE]":
@@ -711,7 +1001,6 @@ def stream_response(resp: httpx.Response):
         piece = delta.get("content")
         if piece:
             text_buf += str(piece)
-            # Use Text so model-generated Rich markup cannot corrupt the TUI.
             console.print(Text(str(piece)), end="")
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
@@ -728,13 +1017,13 @@ def stream_response(resp: httpx.Response):
                 tool_calls[idx]["function"]["name"] += fn["name"]
             if fn.get("arguments"):
                 tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-
     return text_buf, [tool_calls[i] for i in sorted(tool_calls)]
 
 
 def parse_anthropic_response(d: dict):
-    text = []
-    calls = []
+    if "error" in d:
+        raise RuntimeError(str(d["error"]))
+    text, calls = [], []
     for block in d.get("content", []):
         if block.get("type") == "text":
             text.append(block.get("text", ""))
@@ -751,10 +1040,8 @@ def parse_anthropic_response(d: dict):
 
 
 def stream_anthropic(resp: httpx.Response):
-    text_buf = ""
-    calls = {}
+    text_buf, calls = "", {}
     content_type = resp.headers.get("content-type", "").lower()
-
     if "text/event-stream" not in content_type:
         return parse_anthropic_response(resp.json())
 
@@ -767,7 +1054,6 @@ def stream_anthropic(resp: httpx.Response):
             event = json.loads(line[5:].strip())
         except json.JSONDecodeError:
             continue
-
         etype = event.get("type")
         if etype == "error":
             raise RuntimeError(json.dumps(event.get("error", event)))
@@ -777,10 +1063,7 @@ def stream_anthropic(resp: httpx.Response):
                 current_tool = block.get("id") or str(uuid.uuid4())
                 calls[current_tool] = {
                     "id": current_tool, "type": "function",
-                    "function": {
-                        "name": block.get("name", ""),
-                        "arguments": "",
-                    },
+                    "function": {"name": block.get("name", ""), "arguments": ""},
                 }
         elif etype == "content_block_delta":
             delta = event.get("delta") or {}
@@ -792,7 +1075,6 @@ def stream_anthropic(resp: httpx.Response):
                 calls[current_tool]["function"]["arguments"] += delta.get("partial_json", "")
         elif etype == "content_block_stop":
             current_tool = None
-
     return text_buf, list(calls.values())
 
 
@@ -1169,334 +1451,339 @@ def run_agent(messages: list, cfg: dict):
 
 # --- TUI helpers ---
 def show_todos():
-    todos = AGENT_STATE["todos"]
-    if not todos: return
-    table = Table(title="Todos", show_header=True, header_style="bold cyan")
-    table.add_column("Status", width=12)
-    table.add_column("Task")
-    for t in todos:
-        status = t.get("status","pending")
-        icon = {"pending":"○", "in_progress":"◐", "completed":"●", "cancelled":"✗"}.get(status, "?")
-        style = {"pending":"dim", "in_progress":"yellow", "completed":"green", "cancelled":"red"}.get(status, "")
-        table.add_row(f"[{style}]{icon} {status}[/{style}]", t.get("content",""))
-    console.print(table)
+    # Kept for compatibility; the persistent dashboard owns TODO rendering.
+    return None
+
 
 def show_help():
     console.print(Panel("""[cyan]/help[/cyan]        this help
 [cyan]/cd <dir>[/cyan]      change cwd
-[cyan]/model[/cyan]         switch model
-[cyan]/provider[/cyan]      switch provider
-[cyan]/harness[/cyan]       switch harness (native, claude-code, kimi, qwen, deepseek, swe-agent, zcode, minimal)
-[cyan]/init[/cyan]          re-run setup
-[cyan]/plan[/cyan]          toggle plan mode (read-only)
+[cyan]/model[/cyan]         refresh/search/select models
+[cyan]/provider[/cyan]      switch provider and authorize
+[cyan]/harness[/cyan]       switch harness
+[cyan]/init[/cyan]          re-run provider authorization + model discovery
+[cyan]/plan[/cyan]          toggle plan mode
 [cyan]/shell[/cyan]         toggle auto-approve shell
 [cyan]/write[/cyan]         toggle auto-approve file writes
 [cyan]/mcp[/cyan]           manage MCP servers
 [cyan]/skill[/cyan]         manage skills
 [cyan]/acp[/cyan]           start ACP server for editor
-[cyan]/session[/cyan]       session management (new, list, load, save)
+[cyan]/session[/cyan]       session management
 [cyan]/clear[/cyan]         clear conversation
 [cyan]/history[/cyan]       show session history
+[cyan]/health[/cyan]        verify provider authorization
 [cyan]/quit[/cyan]          exit
-[cyan]Ctrl+C[/cyan]         interrupt current run
-[cyan]Enter (during run)[/cyan] steer/redirect
-[cyan]Alt+Enter[/cyan]      queue follow-up""", title="[bold]Scout Commands[/bold]", border_style="cyan"))
+[cyan]Ctrl+C[/cyan]         interrupt current run""", title="[bold]SCODE Commands[/bold]", border_style="cyan"))
 
-# --- REPL ---
-BANNER = """[bold magenta]SCODE[/bold magenta]"""
 
 def repl():
     global CWD, CURRENT_SESSION_ID
-    cfg = ensure_cfg()
+
+    # Check for non-interactive mode first
+    is_non_interactive = len(sys.argv) > 1 or not sys.stdin.isatty()
+
+    cfg = ensure_cfg(non_interactive=is_non_interactive)
     AGENT_STATE["current_harness"] = cfg.get("harness", "native")
-    
-    # Initialize session
     CURRENT_SESSION_ID = str(uuid.uuid4())
-    messages = [{"role":"system","content":SYSTEM_PROMPT.format(cwd=CWD, harness=cfg.get("harness","native"))}]
-    
-    # Show banner
-    console.print(BANNER)
-    show_todos()
-    
-    # Handle command line argument
-    if len(sys.argv) > 1:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT.format(
+        cwd=CWD, harness=cfg.get("harness", "native")
+    )}]
+
+    if is_non_interactive:
         prompt = " ".join(sys.argv[1:])
-        messages.append({"role":"user","content":prompt})
+        messages.append({"role": "user", "content": prompt})
         log_history(CURRENT_SESSION_ID, "user", prompt)
         run_agent(messages, cfg)
         save_session(CURRENT_SESSION_ID, messages)
         return
-    
-    # Initialize layout for split view
-    from rich.layout import Layout
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.text import Text
-    from rich.columns import Columns
-    from rich.align import Align
-    
-    # Track context usage (rough estimate)
-    context_tokens = 0
-    max_context = 8192
-    
+
     def get_context_usage():
-        """Estimate context tokens from messages"""
         total = 0
         for m in messages:
-            if isinstance(m.get("content"), str):
-                total += len(m["content"]) // 4  # rough estimate
+            content = m.get("content")
+            if isinstance(content, str):
+                total += len(content) // 4
             if m.get("tool_calls"):
                 total += len(str(m["tool_calls"])) // 4
-        return min(total, max_context)
-    
-    def render_side_panel():
-        """Render the right side panel with context, MCP, LSP, TODO"""
-        panels = []
-        
-        # Context meter
+        return total
+
+    def dashboard():
         used = get_context_usage()
-        pct = int((used / max_context) * 100)
+        # Prefer selected model's advertised context when available.
+        mm = _selected_model(cfg)
+        max_context = mm.get("context_length") or cfg.get("max_context", 8192)
+        try:
+            max_context = max(1, int(max_context))
+        except Exception:
+            max_context = 8192
+        pct = min(100, int((used / max_context) * 100))
         bar_len = 20
         filled = int(bar_len * pct / 100)
         bar = "█" * filled + "░" * (bar_len - filled)
-        cost_est = used * 0.00001  # very rough estimate
-        panels.append(Panel(
-            f"[bold]Context[/bold]\n"
-            f"{used:,} / {max_context:,} tokens\n"
-            f"[{bar}] {pct}%\n"
-            f"[dim]~${cost_est:.2f} spent[/dim]",
-            title="[cyan]Context[/cyan]", border_style="cyan", width=35
-        ))
-        
-        # MCP servers
-        mcp_servers = cfg.get("mcp_servers", [])
-        mcp_lines = []
-        if mcp_servers:
-            for s in mcp_servers:
-                mcp_lines.append(f"  [green]●[/green] {s['name']} ({s['transport']})")
-        else:
-            mcp_lines.append("  [dim]No MCP servers configured[/dim]")
-            mcp_lines.append("  [dim]Use /mcp to add[/dim]")
-        panels.append(Panel(
-            "\n".join(mcp_lines),
-            title="[cyan]MCP[/cyan]", border_style="cyan", width=35
-        ))
-        
-        # LSP status
-        lsp_lines = ["  [green]●[/green] typescript", "  [green]●[/green] python", "  [dim]● eslint[/dim]"]
-        panels.append(Panel(
-            "\n".join(lsp_lines),
-            title="[cyan]LSP[/cyan]", border_style="cyan", width=35
-        ))
-        
-        # TODO list
-        todos = AGENT_STATE["todos"]
-        if todos:
-            todo_lines = []
-            for t in todos[:8]:
-                status = t.get("status", "pending")
-                icon = {"pending": "○", "in_progress": "◐", "completed": "●", "cancelled": "✗"}.get(status, "?")
-                style = {"pending": "dim", "in_progress": "yellow", "completed": "green", "cancelled": "red"}.get(status, "")
-                todo_lines.append(f"  [{style}]{icon} {t.get('content', '')[:30]}[/{style}]")
-            if len(todos) > 8:
-                todo_lines.append(f"  [dim]...and {len(todos) - 8} more[/dim]")
-        else:
+
+        context_panel = Panel(
+            f"{used:,} / {max_context:,} tokens\n[{bar}] {pct}%\n"
+            f"[dim]catalog: {len(get_cached_models(cfg))} models[/dim]",
+            title="[cyan]Context[/cyan]", border_style="cyan", width=38,
+        )
+
+        mcp = cfg.get("mcp_servers", [])
+        mcp_lines = [
+            f"  [green]●[/green] {s.get('name','?')} ({s.get('transport','?')})"
+            for s in mcp
+        ] or ["  [dim]No MCP servers configured[/dim]", "  [dim]Use /mcp to add[/dim]"]
+        mcp_panel = Panel("\n".join(mcp_lines), title="[cyan]MCP[/cyan]",
+                          border_style="cyan", width=38)
+
+        # LSP is a stable dashboard state, not a printed block on every command.
+        lsp_lines = ["  [green]●[/green] typescript",
+                     "  [green]●[/green] python",
+                     "  [dim]●[/dim] eslint"]
+        lsp_panel = Panel("\n".join(lsp_lines), title="[cyan]LSP[/cyan]",
+                          border_style="cyan", width=38)
+
+        todos = AGENT_STATE.get("todos", [])
+        todo_lines = []
+        for t in todos[:8]:
+            status = t.get("status", "pending")
+            icon = {"pending": "○", "in_progress": "◐",
+                    "completed": "●", "cancelled": "✗"}.get(status, "?")
+            style = {"pending": "dim", "in_progress": "yellow",
+                     "completed": "green", "cancelled": "red"}.get(status, "")
+            todo_lines.append(f"  [{style}]{icon} {t.get('content','')[:34]}[/{style}]")
+        if not todo_lines:
             todo_lines = ["  [dim]No tasks[/dim]", "  [dim]Agent will create[/dim]"]
-        panels.append(Panel(
-            "\n".join(todo_lines),
-            title="[cyan]TODO[/cyan]", border_style="cyan", width=35
-        ))
-        
-        return Columns(panels, equal=True, expand=True)
-    
-    def render_main_area():
-        """Render the main conversation area"""
-        # This would show recent messages, but we keep it simple
-        # The actual conversation is printed by run_agent
-        return Panel(
-            "[dim]Main agent session[/dim]\n[dim]Output appears here[/dim]",
-            title="[bold magenta]SCODE[/bold magenta]", border_style="magenta"
+        if len(todos) > 8:
+            todo_lines.append(f"  [dim]...and {len(todos)-8} more[/dim]")
+        todo_panel = Panel("\n".join(todo_lines), title="[cyan]TODO[/cyan]",
+                           border_style="cyan", width=38)
+
+        status = (
+            f"[bold]{cfg.get('provider','?')}/{cfg.get('model','?')}[/bold] | "
+            f"{AGENT_STATE.get('current_harness', cfg.get('harness','native'))} | "
+            f"{'PLAN' if AGENT_STATE.get('plan_mode') else 'WRITE'}"
         )
-    
-    def render_bottom_bar():
-        """Render bottom status/keyboard bar"""
-        provider = cfg.get('provider', '?')
-        model = cfg.get('model', '?')
-        harness = AGENT_STATE.get('current_harness', cfg.get('harness', 'native'))
-        return Panel(
-            f"[bold]{provider}/{model}[/bold] | {harness} | "
-            f"[cyan]Esc[/cyan] interrupt  [cyan]Tab[/cyan] session  [cyan]Ctrl+P[/cyan] commands  [cyan]Ctrl+X←/→[/cyan] nav",
-            border_style="dim", width=None
+        footer = Panel(
+            status + " | [cyan]/model[/cyan] search  [cyan]/provider[/cyan] authorize  "
+            "[cyan]Ctrl+C[/cyan] interrupt",
+            border_style="dim",
         )
-    
-    # Initial render of side panel
-    console.print(render_side_panel())
-    console.print(render_bottom_bar())
-    
-    while True:
-        console.print()
-        try:
-            user_input = Prompt.ask("[bold green]🚀[/bold green] ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]bye[/dim]")
-            save_session(CURRENT_SESSION_ID, messages)
-            return
-        if not user_input:
-            console.print(render_side_panel())
-            continue
-        
-        if user_input.startswith("/"):
-            parts = user_input.split(maxsplit=2)
-            cmd = parts[0]
-            
-            if cmd == "/quit":
+        return Columns([context_panel, mcp_panel, lsp_panel, todo_panel],
+                       equal=True, expand=True), footer
+
+    def refresh(live):
+        side, footer = dashboard()
+        live.update(Columns([side, footer]))
+
+    # The dashboard is rendered exactly once and updated in-place. Agent output
+    # and command output are printed above it; the dashboard itself never repeats.
+    side, footer = dashboard()
+    live_render = Columns([side, footer])
+    with Live(live_render, console=console, refresh_per_second=4, transient=False) as live:
+        while True:
+            try:
+                user_input = Prompt.ask("[bold green]🚀[/bold green]").strip()
+            except (EOFError, KeyboardInterrupt):
                 save_session(CURRENT_SESSION_ID, messages)
                 return
-            elif cmd == "/help":
-                show_help()
-            elif cmd == "/cd":
-                target = parts[1] if len(parts)>1 else str(HOME)
-                p = Path(target).expanduser().resolve()
-                if p.is_dir():
-                    CWD = p
-                    messages[0]["content"] = SYSTEM_PROMPT.format(cwd=CWD, harness=cfg.get("harness","native"))
-                    console.print(f"[dim]cwd: {CWD}[/dim]")
-                else:
-                    console.print(f"[red]not a dir: {p}[/red]")
-            elif cmd == "/model":
-                cfg["model"] = Prompt.ask("model", default=cfg["model"])
-                save_cfg(cfg)
-                console.print(f"[dim]→ {cfg['model']}[/dim]")
-            elif cmd == "/provider":
-                names = list(PROVIDERS)
-                for i, n in enumerate(names, 1):
-                    console.print(f"  [cyan]{i}[/cyan] {n}")
-                choice = Prompt.ask("provider", choices=[str(i) for i in range(1, len(names)+1)], default="1")
-                cfg["provider"] = names[int(choice)-1]
-                cfg["api_key"] = Prompt.ask("api key", default=cfg.get("api_key",""), )
-                save_cfg(cfg)
-                console.print(f"[dim]→ {cfg['provider']}[/dim]")
-            elif cmd == "/harness":
-                names = list(HARNESSES)
-                for i, n in enumerate(names, 1):
-                    console.print(f"  [cyan]{i}[/cyan] {n} — {HARNESSES[n]['desc']}")
-                choice = Prompt.ask("harness", choices=[str(i) for i in range(1, len(names)+1)], default="1")
-                cfg["harness"] = names[int(choice)-1]
-                save_cfg(cfg)
-                AGENT_STATE["current_harness"] = cfg["harness"]
-                messages[0]["content"] = SYSTEM_PROMPT.format(cwd=CWD, harness=cfg["harness"])
-                console.print(f"[dim]→ harness: {cfg['harness']}[/dim]")
-            elif cmd == "/init":
-                cfg = ensure_cfg()
-                messages[0]["content"] = SYSTEM_PROMPT.format(cwd=CWD, harness=cfg.get("harness","native"))
-            elif cmd == "/plan":
-                AGENT_STATE["plan_mode"] = not AGENT_STATE["plan_mode"]
-                console.print(f"[dim]plan mode: {'on' if AGENT_STATE['plan_mode'] else 'off'}[/dim]")
-            elif cmd == "/shell":
-                cfg["auto_approve_shell"] = not cfg.get("auto_approve_shell", False)
-                save_cfg(cfg)
-                console.print(f"[dim]auto-approve shell: {cfg['auto_approve_shell']}[/dim]")
-            elif cmd == "/write":
-                cfg["auto_approve_write"] = not cfg.get("auto_approve_write", True)
-                save_cfg(cfg)
-                console.print(f"[dim]auto-approve write: {cfg['auto_approve_write']}[/dim]")
-            elif cmd == "/mcp":
-                console.print("[dim]MCP servers:[/dim]")
-                for s in cfg.get("mcp_servers", []):
-                    console.print(f"  - {s['name']} ({s['transport']})")
-                if Prompt.ask("add server?", choices=["y","n"], default="n") == "y":
-                    name = Prompt.ask("name")
-                    transport = Prompt.ask("transport", choices=["stdio","http","sse"], default="stdio")
-                    if transport == "stdio":
-                        command = Prompt.ask("command")
-                        cfg.setdefault("mcp_servers", []).append({"name":name,"transport":"stdio","command":command})
-                    else:
-                        url = Prompt.ask("url")
-                        cfg.setdefault("mcp_servers", []).append({"name":name,"transport":transport,"url":url})
-                    save_cfg(cfg)
-            elif cmd == "/skill":
-                console.print("[dim]Skills:[/dim]")
-                for f in SKILLS_DIR.glob("*.md"):
-                    console.print(f"  - {f.stem}")
-                action = Prompt.ask("action", choices=["load","create","delete","list"], default="list")
-                if action == "load":
-                    name = Prompt.ask("skill name")
-                    console.print(load_skill(name))
-                elif action == "create":
-                    name = Prompt.ask("name")
-                    console.print("Enter skill markdown (end with EOF/Ctrl+D):")
-                    content = sys.stdin.read()
-                    console.print(t_skill_create(name, content))
-                elif action == "delete":
-                    name = Prompt.ask("name")
-                    (SKILLS_DIR / f"{name}.md").unlink(missing_ok=True)
-                    console.print(f"deleted {name}")
-            elif cmd == "/acp":
-                console.print(start_acp_server())
-                AGENT_STATE["acp_mode"] = True
-            elif cmd == "/session":
-                action = parts[1] if len(parts)>1 else "list"
-                if action == "list":
-                    for sid, created, title in list_sessions():
-                        console.print(f"  {sid[:8]}  {datetime.fromtimestamp(created).strftime('%Y-%m-%d %H:%M')}  {title}")
-                elif action == "new":
+
+            if not user_input:
+                refresh(live)
+                continue
+
+            if user_input.startswith("/"):
+                parts = user_input.split(maxsplit=2)
+                cmd = parts[0]
+
+                if cmd == "/quit":
                     save_session(CURRENT_SESSION_ID, messages)
-                    CURRENT_SESSION_ID = str(uuid.uuid4())
-                    messages = [{"role":"system","content":SYSTEM_PROMPT.format(cwd=CWD, harness=cfg.get("harness","native"))}]
-                    console.print(f"[dim]new session: {CURRENT_SESSION_ID[:8]}[/dim]")
-                elif action == "load":
-                    sid = parts[2] if len(parts)>2 else Prompt.ask("session id")
-                    loaded = load_session(sid)
-                    if loaded:
-                        messages = loaded
-                        CURRENT_SESSION_ID = sid
-                        console.print(f"[dim]loaded session {sid[:8]}[/dim]")
+                    return
+
+                elif cmd == "/help":
+                    show_help()
+
+                elif cmd == "/cd":
+                    target = parts[1] if len(parts) > 1 else str(HOME)
+                    pp = Path(target).expanduser().resolve()
+                    if pp.is_dir():
+                        CWD = pp
+                        messages[0]["content"] = SYSTEM_PROMPT.format(
+                            cwd=CWD, harness=cfg.get("harness", "native"))
+                        console.print(f"[dim]cwd: {CWD}[/dim]")
                     else:
-                        console.print("[red]session not found[/red]")
-                elif action == "save":
-                    title = parts[2] if len(parts)>2 else ""
-                    save_session(CURRENT_SESSION_ID, messages, title)
-                    console.print("[dim]saved[/dim]")
-            elif cmd == "/clear":
-                messages = [messages[0]]
-                console.clear()
-                console.print(BANNER)
-            elif cmd == "/history":
-                with sqlite3.connect(HISTORY_DB) as db:
-                    rows = db.execute("SELECT ts, role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT 20", (CURRENT_SESSION_ID,)).fetchall()
+                        console.print(f"[red]not a dir: {pp}[/red]")
+
+                elif cmd == "/model":
+                    try:
+                        models = fetch_models(cfg, force=True)
+                        cfg["model"] = select_model(cfg, models)
+                        save_cfg(cfg)
+                        console.print(f"[green]→ {cfg['model']}[/green]")
+                    except Exception as e:
+                        console.print(f"[red]model discovery failed: {e}[/red]")
+
+                elif cmd == "/provider":
+                    names = list(PROVIDERS)
+                    for i, n in enumerate(names, 1):
+                        console.print(f"  [cyan]{i}[/cyan] {n}")
+                    choice = Prompt.ask("provider",
+                                        choices=[str(i) for i in range(1, len(names)+1)],
+                                        default="1")
+                    cfg["provider"] = names[int(choice)-1]
+                    cfg["api_key"] = ""
+                    meta = PROVIDERS[cfg["provider"]]
+                    if meta.get("requires_key"):
+                        cfg["api_key"] = Prompt.ask(
+                            f"API key for [cyan]{cfg['provider']}[/cyan]",
+                            password=True, default="")
+                    try:
+                        models = fetch_models(cfg, force=True)
+                        cfg["model"] = select_model(cfg, models)
+                        save_cfg(cfg)
+                        console.print(
+                            f"[green]Authorized. {len(models)} models available. "
+                            f"Selected: {cfg['model']}[/green]"
+                        )
+                    except Exception as e:
+                        console.print(f"[red]authorization/model discovery failed: {e}[/red]")
+
+                elif cmd == "/harness":
+                    names = list(HARNESSES)
+                    for i, n in enumerate(names, 1):
+                        console.print(f"  [cyan]{i}[/cyan] {n} — {HARNESSES[n]['desc']}")
+                    choice = Prompt.ask("harness",
+                                        choices=[str(i) for i in range(1, len(names)+1)],
+                                        default="1")
+                    cfg["harness"] = names[int(choice)-1]
+                    AGENT_STATE["current_harness"] = cfg["harness"]
+                    messages[0]["content"] = SYSTEM_PROMPT.format(
+                        cwd=CWD, harness=cfg["harness"])
+                    save_cfg(cfg)
+
+                elif cmd == "/init":
+                    try:
+                        cfg = ensure_cfg(non_interactive=False)
+                        messages[0]["content"] = SYSTEM_PROMPT.format(
+                            cwd=CWD, harness=cfg.get("harness", "native"))
+                        AGENT_STATE["current_harness"] = cfg.get("harness", "native")
+                    except Exception as e:
+                        console.print(f"[red]init failed: {e}[/red]")
+
+                elif cmd == "/plan":
+                    AGENT_STATE["plan_mode"] = not AGENT_STATE["plan_mode"]
+
+                elif cmd == "/shell":
+                    cfg["auto_approve_shell"] = not cfg.get("auto_approve_shell", False)
+                    save_cfg(cfg)
+
+                elif cmd == "/write":
+                    cfg["auto_approve_write"] = not cfg.get("auto_approve_write", True)
+                    save_cfg(cfg)
+
+                elif cmd == "/mcp":
+                    console.print("[dim]MCP servers:[/dim]")
+                    for s in cfg.get("mcp_servers", []):
+                        console.print(f"  - {s.get('name','?')} ({s.get('transport','?')})")
+                    if Prompt.ask("add server?", choices=["y","n"], default="n") == "y":
+                        name = Prompt.ask("name")
+                        transport = Prompt.ask("transport", choices=["stdio","http","sse"], default="stdio")
+                        if transport == "stdio":
+                            command = Prompt.ask("command")
+                            cfg.setdefault("mcp_servers", []).append(
+                                {"name": name, "transport": "stdio", "command": command})
+                        else:
+                            url = Prompt.ask("url")
+                            cfg.setdefault("mcp_servers", []).append(
+                                {"name": name, "transport": transport, "url": url})
+                        save_cfg(cfg)
+
+                elif cmd == "/skill":
+                    console.print("[dim]Skills:[/dim]")
+                    for f in SKILLS_DIR.glob("*.md"):
+                        console.print(f"  - {f.stem}")
+                    action = Prompt.ask("action",
+                                        choices=["load","create","delete","list"],
+                                        default="list")
+                    if action == "load":
+                        console.print(load_skill(Prompt.ask("skill name")))
+                    elif action == "create":
+                        name = Prompt.ask("name")
+                        console.print("Enter skill markdown (end with EOF/Ctrl+D):")
+                        content = sys.stdin.read()
+                        console.print(t_skill_create(name, content))
+                    elif action == "delete":
+                        name = Prompt.ask("name")
+                        (SKILLS_DIR / f"{name}.md").unlink(missing_ok=True)
+
+                elif cmd == "/acp":
+                    console.print(start_acp_server())
+                    AGENT_STATE["acp_mode"] = True
+
+                elif cmd == "/session":
+                    action = parts[1] if len(parts) > 1 else "list"
+                    if action == "list":
+                        for sid, created, title in list_sessions():
+                            console.print(
+                                f"  {sid[:8]} {datetime.fromtimestamp(created).strftime('%Y-%m-%d %H:%M')} {title}"
+                            )
+                    elif action == "new":
+                        save_session(CURRENT_SESSION_ID, messages)
+                        CURRENT_SESSION_ID = str(uuid.uuid4())
+                        messages = [{"role":"system","content":SYSTEM_PROMPT.format(
+                            cwd=CWD, harness=cfg.get("harness","native"))}]
+                    elif action == "load":
+                        sid = parts[2] if len(parts) > 2 else Prompt.ask("session id")
+                        loaded = load_session(sid)
+                        if loaded:
+                            messages = loaded
+                            CURRENT_SESSION_ID = sid
+                    elif action == "save":
+                        title = parts[2] if len(parts) > 2 else ""
+                        save_session(CURRENT_SESSION_ID, messages, title)
+
+                elif cmd == "/clear":
+                    messages = [messages[0]]
+                    console.print("[dim]conversation cleared[/dim]")
+
+                elif cmd == "/history":
+                    with sqlite3.connect(HISTORY_DB) as db:
+                        rows = db.execute(
+                            "SELECT ts, role, content FROM history WHERE session_id=? "
+                            "ORDER BY id DESC LIMIT 20", (CURRENT_SESSION_ID,)
+                        ).fetchall()
                     for ts, role, content in reversed(rows):
-                        console.print(f"[dim]{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}[/dim] [{role}] {content[:100]}")
-            elif cmd == "/health":
-                try:
-                    cfg_test = load_cfg()
-                    provider_test = cfg_test.get("provider")
-                    meta_test = PROVIDERS.get(provider_test)
-                    if not meta_test:
-                        raise RuntimeError(f"unknown provider: {provider_test}")
-                    if meta_test.get("kind") == "anthropic":
-                        rr = httpx.get(meta_test["base"] + "/models", headers=_anthropic_headers(cfg_test), timeout=15)
-                    else:
-                        rr = httpx.get(meta_test["base"] + "/models", headers=_openai_headers(cfg_test), timeout=15)
-                    if rr.status_code < 400:
-                        console.print(f"[green]provider reachable: {provider_test}[/green]")
-                    else:
-                        console.print(f"[red]{_api_error(rr)}[/red]")
-                except Exception as e:
-                    console.print(f"[red]health error: {e}[/red]")
-            else:
-                console.print(f"[red]unknown: {cmd}[/red]")
-            
-            console.print(render_side_panel())
-            console.print(render_bottom_bar())
-            continue
-        
-        # Regular user input - run agent
-        messages.append({"role":"user","content":user_input})
-        log_history(CURRENT_SESSION_ID, "user", user_input)
-        run_agent(messages, cfg)
-        save_session(CURRENT_SESSION_ID, messages)
-        console.print(render_side_panel())
-        console.print(render_bottom_bar())
+                        console.print(
+                            f"[dim]{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}[/dim] "
+                            f"[{role}] {content[:100]}"
+                        )
+
+                elif cmd == "/health":
+                    try:
+                        models = fetch_models(cfg, force=True)
+                        current = cfg.get("model")
+                        ids = {m["id"] for m in models}
+                        if current not in ids:
+                            cfg["model"] = select_model(cfg, models)
+                        save_cfg(cfg)
+                        console.print(
+                            f"[green]Authorized. {len(models)} usable models. "
+                            f"Current: {cfg['model']}[/green]"
+                        )
+                    except Exception as e:
+                        console.print(f"[red]health failed: {e}[/red]")
+
+                else:
+                    console.print(f"[red]unknown: {cmd}[/red]")
+
+                refresh(live)
+                continue
+
+            messages.append({"role": "user", "content": user_input})
+            log_history(CURRENT_SESSION_ID, "user", user_input)
+            run_agent(messages, cfg)
+            save_session(CURRENT_SESSION_ID, messages)
+            refresh(live)
+
 
 if __name__ == "__main__":
     repl()
