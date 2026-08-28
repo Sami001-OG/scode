@@ -861,14 +861,7 @@ def show_help():
 [cyan]Alt+Enter[/cyan]      queue follow-up""", title="[bold]Scout Commands[/bold]", border_style="cyan"))
 
 # --- REPL ---
-BANNER = """[bold cyan]  ██████  ██       █████  ██    ██  ██████  
-[bold cyan]  ██   ██ ██      ██   ██ ██    ██ ██    ██ 
-[bold cyan]  ██████  ██      ███████ ██    ██ ██    ██ 
-[bold cyan]  ██   ██ ██      ██   ██ ██    ██ ██    ██ 
-[bold cyan]  ██   ██ ███████ ██   ██  ██████   ██████  
-[bold cyan]                                        
-[bold magenta]        SCODE | {cwd} | {harness}
-[dim]type /help for commands, /quit to exit[/dim]"""
+BANNER = """[bold magenta]SCODE[/bold magenta]"""
 
 def repl():
     global CWD, CURRENT_SESSION_ID
