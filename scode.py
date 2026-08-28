@@ -271,27 +271,22 @@ def t_notebook_edit(path: str, cell_index: int, content: str, cell_type: str = "
 def t_web_search(query: str, limit: int = 5) -> str:
     try:
         r = httpx.get("https://html.duckduckgo.com/html/", params={"q": query}, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
-        from html.parser import HTMLParser
-        class P(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.results = []
-                self.in_result = False
-                self.current = {}
-            def handle_starttag(self, tag, attrs):
-                if tag == "a" and any(k=="class" and "result__url" in v for k,v in attrs):
-                    self.in_result = True
-                if self.in_result and tag == "a" and any(k=="class" and "result__snippet" in v for k,v in attrs):
-                    pass
-            def handle_data(self, data):
-                pass
-        # simpler regex approach
-        results = re.findall(r'class="result__snippet".*?>(.*?)</a>.*?class="result__url".*?>(.*?)</a>', r.text, re.S)
+        html = r.text
+        # DuckDuckGo's HTML result markup: title link (result__a) comes first,
+        # then a result__snippet block later in the same result div.
+        titles = re.findall(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html, re.S)
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
         out = []
-        for snippet, url in results[:limit]:
-            snippet = re.sub(r"<[^>]+>", "", snippet).strip()
+        for i in range(min(limit, len(titles))):
+            url, title = titles[i]
+            title = re.sub(r"<[^>]+>", "", title).strip()
             url = re.sub(r"<[^>]+>", "", url).strip()
-            out.append(f"- {snippet}\n  {url}")
+            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
+            line = f"- {title}"
+            if snippet:
+                line += f"\n  {snippet}"
+            line += f"\n  {url}"
+            out.append(line)
         return "\n".join(out) or "(no results)"
     except Exception as e: return f"ERROR: {e}"
 
@@ -384,16 +379,30 @@ def call_mcp(server: dict, tool: str, args: dict) -> str:
         cmd = server["command"]
         proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         req = json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}) + "\n"
-        out, err = proc.communicate(req, timeout=30)
+        try:
+            out, err = proc.communicate(req, timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            return f"ERROR: MCP server '{server.get('name','?')}' timed out"
+        except Exception as e:
+            proc.kill()
+            return f"ERROR: MCP call failed: {e}"
+        if proc.returncode not in (0, None) and not out.strip():
+            return f"ERROR: MCP server '{server.get('name','?')}' exited {proc.returncode}: {err.strip()[:500]}"
         try:
             resp = json.loads(out.strip().split("\n")[-1])
             return json.dumps(resp.get("result", resp.get("error", "unknown")), indent=2)
-        except:
-            return out or err or "no response"
+        except Exception:
+            return out.strip() or err.strip() or "no response"
     elif transport in ("http", "sse"):
         url = server["url"]
-        r = httpx.post(f"{url}/mcp", json={"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}, timeout=30)
-        return json.dumps(r.json(), indent=2)
+        try:
+            r = httpx.post(f"{url}/mcp", json={"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}, timeout=30)
+            r.raise_for_status()
+            return json.dumps(r.json(), indent=2)
+        except Exception as e:
+            return f"ERROR: MCP HTTP call failed: {e}"
     return "ERROR: unknown transport"
 
 # --- skills ---
@@ -406,14 +415,6 @@ def load_skill(name: str) -> str:
         else:
             return f"ERROR: skill '{name}' not found"
     content = path.read_text()
-    # parse frontmatter
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            import yaml
-            try: meta = yaml.safe_load(parts[1])
-            except: meta = {}
-    # register skill tools if defined
     return f"loaded skill: {name}\n{content[:2000]}"
 
 # --- ACP (Agent Client Protocol) ---
@@ -448,9 +449,17 @@ def run_subagent(goal: str, context: str) -> str:
                 name = c["function"]["name"]
                 try: args = json.loads(c["function"]["arguments"])
                 except: args = {}
-                out = TOOLS[name]["fn"](**args) if name in TOOLS else f"ERROR: unknown tool {name}"
+                if name not in TOOLS:
+                    out = f"ERROR: unknown tool {name}"
+                elif not confirm_tool(name, args):
+                    out = "DENIED by user"
+                else:
+                    try:
+                        out = TOOLS[name]["fn"](**args)
+                    except Exception as e:
+                        out = f"ERROR: {e}"
                 console.print(f"  [dim]sub[/dim] [cyan]{name}[/cyan] → {str(out)[:120]}")
-                msgs.append({"role":"tool","tool_call_id":c["id"],"content":out})
+                msgs.append({"role":"tool","tool_call_id":c["id"],"content":str(out)})
         else:
             return text or "(no output)"
     return "ERROR: subagent hit max iterations"
@@ -491,7 +500,9 @@ def stream_response(resp):
         if data.strip() == "[DONE]": break
         try: d = json.loads(data)
         except: continue
-        delta = d["choices"][0].get("delta", {})
+        choices = d.get("choices") or []
+        if not choices: continue
+        delta = choices[0].get("delta", {})
         if "content" in delta and delta["content"]:
             text_buf += delta["content"]
             console.print(delta["content"], end="")
@@ -624,20 +635,22 @@ def t_test_coverage(command: str) -> str:
 def t_repo_structure(depth: int = 2) -> str:
     """Show repository structure as a tree."""
     try:
-        import subprocess
-        result = subprocess.run(["find", ".", "-type", "f", "-not", "-path", "*/.*/*"], 
+        result = subprocess.run(["find", ".", "-type", "f", "-not", "-path", "*/.*/*"],
                               capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             files = result.stdout.strip().split('\n')
-            # Simple tree view
+            # Simple tree view, respecting the requested depth
             tree_lines = []
             for f in sorted(files):
-                if f:  # Skip empty lines
-                    depth = f.count('/')
-                    indent = "  " * depth
-                    name = f.split('/')[-1] if '/' in f else f
-                    tree_lines.append(f"{indent}{name}")
-            return '\n'.join(tree_lines[:100]) or "(no files)"
+                if not f:  # Skip empty lines
+                    continue
+                file_depth = f.count('/')
+                if file_depth > depth:
+                    continue
+                indent = "  " * file_depth
+                name = f.split('/')[-1] if '/' in f else f
+                tree_lines.append(f"{indent}{name}")
+            return '\n'.join(tree_lines[:100]) or "(no files within depth)"
         else:
             return f"ERROR: {result.stderr}"
     except Exception as e:
@@ -738,22 +751,22 @@ def t_agents_write(content: str) -> str:
 })
 def t_context_compact(keep_last: int = 5) -> str:
     """Compact the conversation history to reduce token usage."""
-    global messages
+    messages = AGENT_STATE.get("active_messages")
+    if messages is None:
+        return "ERROR: no active conversation to compact"
     if len(messages) <= keep_last + 2:  # +2 for system and maybe one other
         return f"(history only {len(messages)} messages, no compaction needed)"
-    
+
     # Keep system message and last N messages
     system_msgs = [m for m in messages if m.get("role") == "system"]
     recent_msgs = messages[-(keep_last):] if len(messages) > keep_last else []
-    
+
     # What we're removing
     removed_count = len(messages) - len(system_msgs) - len(recent_msgs)
-    
-    # Rebuild messages
-    messages.clear()
-    messages.extend(system_msgs)
-    messages.extend(recent_msgs)
-    
+
+    # Rebuild messages in place (mutate the list the caller holds a reference to)
+    messages[:] = system_msgs + recent_msgs
+
     return f"compacted context: removed {removed_count} messages, kept {len(messages)}"
 
 # --- long running task helpers (Codex-like) ---
@@ -779,6 +792,7 @@ Capabilities: file ops, bash, grep, git, web, subagents, MCP, skills, ACP, harne
 
 def run_agent(messages: list, cfg: dict):
     global CURRENT_SESSION_ID
+    AGENT_STATE["active_messages"] = messages
     minimal = cfg.get("harness") == "minimal"
     for it in range(cfg.get("max_iter", 50)):
         if AGENT_STATE["interrupted"]:
