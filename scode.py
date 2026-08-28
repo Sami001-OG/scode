@@ -861,13 +861,18 @@ def show_help():
 [cyan]Alt+Enter[/cyan]      queue follow-up""", title="[bold]Scout Commands[/bold]", border_style="cyan"))
 
 # --- REPL ---
-BANNER = """[bold cyan]  ____  _           _     _____      _   
-[bold cyan] |  _ \|| |__   __ _| |__ | ____|_  _| |_ 
-[bold cyan] | |_) || '_ \ / _` | '_ \|  _| \ \/ / __|
-[bold cyan] |  _ <|| | | | (_| | | | | |___ >  <| |_ 
-[bold cyan] |_| \_\_|| |_|\__,_|_| |_|_____/_/\_\\__|
+BANNER = """[bold cyan]  ███████  ██████  ██████   ██████  ██████  
+[bold cyan]  ██      ██    ██ ██   ██ ██    ██ ██   ██ 
+[bold cyan]  █████   ██    ██ ██████  ██    ██ ██████  
+[bold cyan]  ██      ██    ██ ██   ██ ██    ██ ██   ██ 
+[bold cyan]  ███████  ██████  ██   ██  ██████  ██   ██ 
 [bold cyan]                                        
-[dim]Scout v2 · {cwd} | {harness}[/dim]
+[bold magenta]  ███████  ██████  ██       █████  ██████  
+[bold magenta]  ██      ██    ██ ██      ██   ██ ██   ██ 
+[bold magenta]  ███████ ██    ██ ██      ███████ ██████  
+[bold magenta]       ██ ██    ██ ██      ██   ██ ██   ██ 
+[bold magenta]  ███████  ██████  ███████ ██   ██ ██   ██ 
+[dim]                                     SCODE | {cwd} | {harness}
 [dim]type /help for commands, /quit to exit[/dim]"""
 
 def repl():
